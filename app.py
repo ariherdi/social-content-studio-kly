@@ -65,7 +65,7 @@ def is_article_image(u):
 def original_url(resized_url):
     """Build KapanLagi full-resolution download URL from filename date."""
     f = filename_from_url(resized_url)
-    m = re.search(r"(?<!\\d)((?:19|20)\\d{6})(?!\\d)", f)
+    m = re.search(r"(?<!\d)((?:19|20)\d{6})(?!\d)", f)
     if not m:
         return None
     d = m.group(1)

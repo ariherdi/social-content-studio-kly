@@ -101,3 +101,19 @@ Tanggal `YYYYMMDD` diambil dari filename foto pada URL resized.
 Tidak ada lagi filter ukuran HTML atau filter `670x`. Foto ditentukan hanya dari struktur gallery `content-pages`, kemudian URL final diganti ke URL `download` full-res.
 
 Caption tetap diambil dari `.pages-paragraph`.
+
+
+## V11 — Critical regex fix
+
+V10 masih memiliki escaping regex yang salah pada pembacaan tanggal filename.
+V11 menggunakan regex Python yang benar:
+
+`(?<!\d)((?:19|20)\d{6})(?!\d)`
+
+Sehingga filename seperti:
+
+`yoona_girls_generation-20260926-006-non_fotografer_kly.jpg`
+
+berhasil menghasilkan:
+
+`https://cdns.klimg.com/kapanlagi.com/download/g/2026/09/26/r/yoona_girls_generation-20260926-006-non_fotografer_kly.jpg`
