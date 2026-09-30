@@ -725,14 +725,54 @@ def ai_rewrite(text):
         return text[:100]
 
 
+@st.cache_data(show_spinner=False, max_entries=40)
 def load_image(url):
     r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
     r.raise_for_status()
     return Image.open(io.BytesIO(r.content)).convert("RGBA")
 
+BASE_CANVAS_WIDTH = 1080  # slider "Ukuran font" mengacu ke lebar 1080 px, lalu diskalakan ke lebar gambar
+
+SYSTEM_FONT_FALLBACKS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+]
+
+
 def font_path(name):
-    p = os.path.join("fonts", FONT_MAP.get(name, "Inter-Regular.ttf"))
-    return p if os.path.exists(p) else None
+    fname = FONT_MAP.get(name, "Inter-Regular.ttf")
+    here = os.path.dirname(os.path.abspath(globals().get("__file__", ".")))
+    for base in ("fonts", os.path.join(here, "fonts")):
+        p = os.path.join(base, fname)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def load_font(name, size):
+    """Return (font, label). Always a scalable font so the size slider works."""
+    size = max(8, int(size))
+    p = font_path(name)
+    if p:
+        try:
+            return ImageFont.truetype(p, size), name
+        except Exception:
+            pass
+    for sp in SYSTEM_FONT_FALLBACKS:
+        if os.path.exists(sp):
+            try:
+                return ImageFont.truetype(sp, size), f"cadangan: {os.path.basename(sp)}"
+            except Exception:
+                continue
+    try:
+        return ImageFont.load_default(size=size), "cadangan: bawaan Pillow"
+    except TypeError:  # Pillow < 10.1: bitmap font, ukuran tidak bisa diubah
+        return ImageFont.load_default(), "bawaan Pillow lama (ukuran tidak berubah)"
+
 
 def fit_cover(img, size):
     W, H = size
@@ -751,11 +791,8 @@ def draw_text_layer(base, text, font_name, font_size, text_color,
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
 
-    fp = font_path(font_name)
-    try:
-        font = ImageFont.truetype(fp, font_size) if fp else ImageFont.load_default()
-    except Exception:
-        font = ImageFont.load_default()
+    font_size = max(8, int(round(font_size * W / BASE_CANVAS_WIDTH)))
+    font, _ = load_font(font_name, font_size)
 
     margin = max(32, int(W * 0.06))
     max_width = W - margin * 2
@@ -936,9 +973,13 @@ if st.session_state.photos:
     c1, c2, c3 = st.columns(3)
     with c1:
         font_name = st.selectbox("Font", list(FONT_MAP.keys()))
+        _, _flabel = load_font(font_name, 24)
+        if _flabel.startswith(("cadangan", "bawaan")):
+            st.warning(f"File font {FONT_MAP.get(font_name)} tidak ada di folder fonts/. Dipakai {_flabel}.")
         position = st.selectbox("Posisi teks", ["Bawah", "Tengah", "Atas"], index=0)
     with c2:
         font_size = st.slider("Ukuran font", 24, 120, 54)
+        st.caption("Ukuran mengacu ke lebar 1080 px dan otomatis diskalakan ke lebar foto/template.")
         align = st.selectbox("Alignment", ["Kiri", "Tengah", "Kanan"], index=0)
     with c3:
         text_color_hex = st.color_picker("Warna teks", "#FFFFFF")
