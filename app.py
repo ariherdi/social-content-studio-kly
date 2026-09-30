@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import os
@@ -518,6 +519,52 @@ def caption_from_detail(detail_html, filename):
     return texts[0] if texts else ""
 
 
+def gallery_page_url(article_url, n):
+    """KapanLagi page for photo n (1-based): the article itself for photo 1, ?page=n after that."""
+    base = urlparse(article_url)._replace(query="", fragment="").geturl()
+    return base if n <= 1 else f"{base}?page={n}"
+
+
+def article_total_photos(soup):
+    """Expected number of gallery photos: data-pagemax or the 'PREV 1/7 NEXT' counter."""
+    best = 0
+    for el in soup.select("[data-pagemax]"):
+        try:
+            best = max(best, min(30, int(el.get("data-pagemax"))))
+        except Exception:
+            pass
+    text = soup.get_text(" ", strip=True)
+    for m in re.finditer(r"PREV|NEXT", text):
+        seg = text[max(0, m.start() - 60): m.end() + 60]
+        mm = re.search(r"(?<![\d./])(\d{1,2})\s*/\s*(\d{1,2})(?![\d./])", seg)
+        if mm and 1 <= int(mm.group(1)) <= int(mm.group(2)) <= 30:
+            best = max(best, int(mm.group(2)))
+    return best
+
+
+_DETAIL_PATH_RE = re.compile(r"/(\d{3,})([A-Za-z0-9_\-]*?-(?:19|20)\d{6}-[A-Za-z0-9_\-]*)\.html$", re.I)
+
+
+def harvest_detail_links(raw_pages, base_url):
+    """{stem: (article_id, url)} for every per-photo detail link (.../<id><stem>.html) in any response."""
+    out = {}
+    pat = re.compile(r"""(?:https?:)?//[^\s"'<>\\()]+?\.html|(?<=["'(])/[^\s"'<>\\()]+?\.html""")
+    for html in raw_pages.values():
+        for m in pat.finditer((html or "").replace("\\/", "/")):
+            u = urljoin(base_url, m.group(0)).split("#")[0]
+            pu = urlparse(u)
+            if "kapanlagi.com" not in pu.netloc:
+                continue
+            mm = _DETAIL_PATH_RE.search(pu.path)
+            if mm and mm.group(2) not in out:
+                out[mm.group(2)] = (mm.group(1), u)
+    return out
+
+
+def stem_of(filename):
+    return os.path.splitext(filename)[0]
+
+
 def extract_page(url):
     html, first_diag = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
@@ -551,10 +598,13 @@ def extract_page(url):
             "decision": note,
         }
 
+    total = article_total_photos(soup)
+
     # 1. Base response = photo 1
     ev = analyse_response(html)
     register_images(photos, ev["img_urls"], url)
     rows.append(row(url, first_diag, ev, apply_response(photos, ev, 1, is_base=True), None))
+    rows[0]["total_expected"] = total
 
     # 2. ?page=N responses
     pagemap = {}
@@ -566,7 +616,7 @@ def extract_page(url):
     base_clean = urlparse(url)._replace(query="", fragment="").geturl()
 
     n = 1
-    while n <= min(30, max(len(photos), 5)):
+    while n <= min(30, max(len(photos), total, 5)):
         if photos and all(p["caption"] for p in photos) and n > len(photos):
             break
         purl = pagemap.get(n) or f"{base_clean}?page={n}"
@@ -581,6 +631,35 @@ def extract_page(url):
         register_images(photos, pev["img_urls"], purl)
         rows.append(row(purl, meta, pev, apply_response(photos, pev, n), n))
         n += 1
+
+    # 2b. Gallery counter says N photos but fewer were listed (e.g. the thumbnail strip
+    # omits the last one): follow per-photo detail links, and NEXT/PREV links of known ones.
+    detail_map = harvest_detail_links(raw_pages, url)
+    guard = 0
+    while total and len(photos) < total and guard < 10:
+        guard += 1
+        known = {stem_of(p["filename"]) for p in photos}
+        new_links = [(s, du) for s, (_id, du) in detail_map.items() if s not in known and du not in raw_pages]
+        if new_links:
+            s, du = new_links[0]
+        else:
+            nxt = [detail_map[stem_of(p["filename"])][1] for p in reversed(photos)
+                   if stem_of(p["filename"]) in detail_map and detail_map[stem_of(p["filename"])][1] not in raw_pages]
+            if not nxt:
+                break
+            s, du = None, nxt[0]
+        try:
+            dh, dmeta = fetch_html(du)
+        except Exception as e:
+            rows.append({"url": du, "decision": f"ERROR: {e}"})
+            raw_pages[du] = ""
+            continue
+        raw_pages[du] = dh
+        dev = analyse_response(dh)
+        if s:
+            register_images(photos, [x for x in dev["img_urls"] if filename_from_url(x).startswith(s)][:1], du)
+        rows.append(row(du, dmeta, dev, f"halaman detail {'(foto baru)' if s else '(mencari NEXT/PREV)'}", None))
+        detail_map = harvest_detail_links(raw_pages, url)
 
     # 3. Fallback: individual photo detail page for photos still empty
     for i, p in enumerate(photos):
@@ -609,7 +688,19 @@ def extract_page(url):
             if cap and cap not in intro and set_caption(photos, i, cap, "Heuristik DOM (LEMAH - periksa manual)"):
                 break
 
-    for p in photos:
+    detail_map = harvest_detail_links(raw_pages, url)
+    any_detail = next(iter(detail_map.values()), None)
+    for k, p in enumerate(photos):
+        stem = stem_of(p["filename"])
+        if stem in detail_map:
+            p["page_url"] = detail_map[stem][1]
+        elif k == 0:
+            p["page_url"] = urlparse(url)._replace(query="", fragment="").geturl()
+        elif any_detail:
+            p["page_url"] = f"{any_detail[1].rsplit('/', 1)[0]}/{any_detail[0]}{stem}.html"
+        else:
+            p["page_url"] = gallery_page_url(url, k + 1)
+        p["total_expected"] = total
         p["caption_found"] = bool(p["caption"])
     return title, intro, photos, rows, raw_pages
 
@@ -725,11 +816,43 @@ def ai_rewrite(text):
         return text[:100]
 
 
+def _fetch_image(url):
+    r = requests.get(
+        url,
+        headers={"User-Agent": UA, "Referer": "https://www.kapanlagi.com/",
+                 "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    try:
+        return Image.open(io.BytesIO(r.content)).convert("RGBA")
+    except Exception:
+        raise RuntimeError(f"bukan gambar ({r.headers.get('content-type', '?')})")
+
+
+def _hero_630(u):
+    """resized/100x100/.../file.jpg -> resized/630x/.../file.jpg (the size used in article bodies)."""
+    return re.sub(r"/resized/\d+x(?:\d+)?/", "/resized/630x/", u) if u and "/resized/" in u else ""
+
+
 @st.cache_data(show_spinner=False, max_entries=40)
+def load_photo(original, resized=""):
+    """Full-resolution download URL first; article 630px version only as a fallback."""
+    errors = []
+    for label, u in (("original", original), ("cadangan 630px", _hero_630(resized))):
+        if not u:
+            continue
+        try:
+            return _fetch_image(u), label
+        except Exception as e:
+            errors.append(f"{label} ({u.rsplit('/', 1)[-1]}): {e}")
+    raise RuntimeError(" | ".join(errors) or "tidak ada URL gambar")
+
+
 def load_image(url):
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
-    r.raise_for_status()
-    return Image.open(io.BytesIO(r.content)).convert("RGBA")
+    return load_photo(url)[0]
+
 
 BASE_CANVAS_WIDTH = 1080  # slider "Ukuran font" mengacu ke lebar 1080 px, lalu diskalakan ke lebar gambar
 
@@ -847,6 +970,26 @@ def draw_text_layer(base, text, font_name, font_size, text_color,
 
     return Image.alpha_composite(canvas, layer)
 
+def clickable_preview_html(img, href, max_w=900):
+    """Inline preview: a data-URI image wrapped in a link to KapanLagi.
+
+    st.image() serves the picture from Streamlit's own media URL, so opening it
+    leads to *.streamlit.app/media/... A data URI has no server URL at all, and
+    the surrounding <a> sends a click to the KapanLagi page instead.
+    """
+    im = img.convert("RGB")
+    if im.width > max_w:
+        im = im.resize((max_w, int(im.height * max_w / im.width)), Image.LANCZOS)
+    b = io.BytesIO()
+    im.save(b, format="JPEG", quality=88)
+    b64 = base64.b64encode(b.getvalue()).decode()
+    return (
+        f'<a href="{href}" target="_blank" rel="noopener noreferrer">'
+        f'<img src="data:image/jpeg;base64,{b64}" '
+        f'style="width:100%;height:auto;border-radius:6px;display:block"></a>'
+    )
+
+
 def apply_template(photo, template_img):
     if template_img is None:
         return photo
@@ -881,6 +1024,8 @@ if "intro" not in st.session_state:
     st.session_state.intro = ""
 if "diagnostics" not in st.session_state:
     st.session_state.diagnostics = []
+if "article_url" not in st.session_state:
+    st.session_state.article_url = ""
 if "ai_last_error" not in st.session_state:
     st.session_state.ai_last_error = ""
 if "raw_pages" not in st.session_state:
@@ -896,6 +1041,7 @@ if st.button("🔎 Analisis Artikel", type="primary") and url:
         title, intro, photos, diagnostics, raw_pages = extract_page(url)
         st.session_state.diagnostics = diagnostics
         st.session_state.raw_pages = raw_pages
+        st.session_state.article_url = url
         st.session_state.title = title
         st.session_state.intro = intro
         st.session_state.photos = photos
@@ -903,7 +1049,10 @@ if st.button("🔎 Analisis Artikel", type="primary") and url:
         for k in [k for k in st.session_state.keys() if k.startswith(("selected_", "orig_", "rewrite_"))]:
             del st.session_state[k]
         n_cap = sum(1 for p in photos if p.get("caption"))
+        _tot = photos[0].get("total_expected", 0) if photos else 0
         st.success(f"Ditemukan {len(photos)} foto besar; caption editorial ditemukan untuk {n_cap} foto.")
+        if _tot and len(photos) < _tot:
+            st.warning(f"Halaman menyebut {_tot} foto, tetapi hanya {len(photos)} yang berhasil diambil. Cek panel diagnosis.")
         if not photos:
             st.warning("Gallery tidak ditemukan pada respons server.")
     except Exception as e:
@@ -921,6 +1070,8 @@ if st.session_state.photos:
                 "caption": "ya" if p.get("caption") else "TIDAK",
                 "panjang": len(p.get("caption", "")),
                 "sumber": p.get("caption_source", ""),
+                "original_url": p.get("original", ""),
+                "page_url": p.get("page_url", ""),
                 "detail_urls": " ; ".join(p.get("detail_urls", [])),
                 "log": " || ".join(p.get("log", [])),
             } for i, p in enumerate(st.session_state.photos)],
@@ -1058,7 +1209,7 @@ if st.session_state.photos:
 
             with right:
                 try:
-                    source_img = load_image(p["original"])
+                    source_img, _img_src = load_photo(p["original"], p.get("resized", ""))
                     rendered = render_social(
                         source_img,
                         st.session_state.rewrites[i],
@@ -1073,7 +1224,18 @@ if st.session_state.photos:
                     )
 
                     st.markdown("**Preview hasil akhir**")
-                    st.image(rendered, use_container_width=True)
+                    _page_link = p.get("page_url") or gallery_page_url(st.session_state.article_url, i + 1)
+                    st.markdown(
+                        clickable_preview_html(rendered, _page_link),
+                        unsafe_allow_html=True,
+                    )
+                    if _img_src != "original":
+                        st.warning(f"Foto original tidak bisa diambil; memakai {_img_src} (resolusi lebih rendah).")
+                    lc1, lc2 = st.columns(2)
+                    with lc1:
+                        st.link_button("🔗 Buka di KapanLagi", _page_link, use_container_width=True)
+                    with lc2:
+                        st.link_button("🖼️ Foto original", p["original"], use_container_width=True)
 
                     bio = io.BytesIO()
                     rendered.save(bio, format="PNG")
@@ -1096,7 +1258,7 @@ if st.session_state.photos:
             if not st.session_state.get(f"selected_{i}", False):
                 continue
             try:
-                img = load_image(p["original"])
+                img = load_photo(p["original"], p.get("resized", ""))[0]
                 rendered = render_social(
                     img,
                     st.session_state.rewrites.get(i, "")[:100],
