@@ -190,56 +190,66 @@ def extract_main_intro(soup):
 
 
 def extract_photo_editorial_text(figure):
-    """Extract only the editorial text belonging to one KapanLagi photo.
+    """Extract editorial text immediately following one gallery photo.
 
-    Priority:
-    1) .pages-paragraph after the figure in the same box-body.
-    2) Any paragraph-like element after the figure in that same box-body,
-       before the next photo, choosing the longest plausible editorial text.
+    Important: KapanLagi can return different DOM variants to different clients.
+    In some responses the editorial paragraph is NOT inside the same box-body as
+    the figure. Therefore this parser deliberately does NOT require a shared
+    parent. It walks forward in document order, stops at the next gallery image,
+    and chooses the strongest paragraph-like text candidate.
 
     Never use img alt or photo credit as caption.
     """
     if not figure:
         return ""
 
-    box_body = figure.find_parent("div", class_="box-body")
-    if box_body is None:
-        return ""
-
     candidates = []
     seen_nodes = set()
 
-    # Walk everything after the figure, but stop at the next gallery photo.
     for node in figure.find_all_next():
-        if getattr(node, "name", None) == "figure" and "pages-img" in (node.get("class") or []):
+        name = getattr(node, "name", None)
+
+        # Stop when the next gallery photo starts.
+        if name == "figure" and "pages-img" in (node.get("class") or []):
             break
-        if getattr(node, "name", None) not in ("div", "p", "section", "article"):
-            continue
-        if node.find_parent("div", class_="box-body") is not box_body:
+
+        # Also stop at the next KapanLagi article image if the wrapper is absent.
+        if name == "img" and node is not figure.find("img"):
+            nxt = extract_img_url(node)
+            if is_article_image(nxt):
+                break
             continue
 
-        classes = set(node.get("class") or [])
-        text = clean_text(node.get_text(" ", strip=True))
-        if not text or len(text) < 40:
+        if name not in ("p", "div", "section", "article"):
             continue
         if node in seen_nodes:
             continue
         seen_nodes.add(node)
 
-        # Credits, labels and UI text are not editorial captions.
+        text = clean_text(node.get_text(" ", strip=True))
+        if not text or len(text) < 40:
+            continue
         if CREDIT_RE.match(text):
             continue
         low = text.lower()
-        if any(x in low for x in ["advertisement - scroll untuk melanjutkan", "hak cipta:"]):
+        if any(x in low for x in [
+            "advertisement - scroll untuk melanjutkan",
+            "hak cipta:",
+            "prev",
+            "next",
+        ]):
             continue
 
-        # Prefer the exact KapanLagi editorial class very strongly.
-        score = len(text)
+        classes = set(node.get("class") or [])
+        score = min(len(text), 800)
         if "pages-paragraph" in classes:
             score += 100000
-        if node.name == "p":
+        if name == "p":
+            score += 5000
+        # Prefer reasonably sized editorial paragraphs over giant wrappers.
+        if len(text) <= 700:
             score += 1000
-        candidates.append((score, text))
+        candidates.append((score, text, name, " ".join(sorted(classes))))
 
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -247,11 +257,14 @@ def extract_photo_editorial_text(figure):
 
     return ""
 
-def extract_photo_editorial_text_from_page_html(page_html):
-    """Raw HTML fallback: extract editorial text after the first gallery figure.
 
-    This intentionally does not depend on exact class names for the paragraph,
-    because KapanLagi responses can differ between crawler/mobile variants.
+def extract_photo_editorial_text_from_page_html(page_html):
+    """Fallback parser for a single KapanLagi photo page.
+
+    The live text representation confirms that the editorial sentence can sit
+    directly after the image and outside the image's box-body. This fallback
+    therefore searches globally after the first gallery figure and before the
+    next gallery image, without relying on a particular wrapper class.
     """
     if not page_html:
         return ""
@@ -260,36 +273,8 @@ def extract_photo_editorial_text_from_page_html(page_html):
     figure = soup.select_one("figure.pages-img")
     if not figure:
         return ""
+    return extract_photo_editorial_text(figure)
 
-    box_body = figure.find_parent("div", class_="box-body")
-    if box_body is None:
-        return ""
-
-    candidates = []
-    for node in figure.find_all_next():
-        if getattr(node, "name", None) == "figure" and "pages-img" in (node.get("class") or []):
-            break
-        if getattr(node, "name", None) not in ("div", "p", "section", "article"):
-            continue
-        if node.find_parent("div", class_="box-body") is not box_body:
-            continue
-        text = clean_text(node.get_text(" ", strip=True))
-        if len(text) < 40 or CREDIT_RE.match(text):
-            continue
-        low = text.lower()
-        if any(x in low for x in ["advertisement - scroll untuk melanjutkan", "hak cipta:"]):
-            continue
-        score = len(text)
-        if "pages-paragraph" in set(node.get("class") or []):
-            score += 100000
-        if node.name == "p":
-            score += 1000
-        candidates.append((score, text))
-
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
-    return ""
 
 def parse_gallery_html(html, source_url, photos, seen):
     soup = BeautifulSoup(html, "html.parser")
@@ -342,7 +327,7 @@ def parse_gallery_html(html, source_url, photos, seen):
             "resized": resized,
             "original": original,
             "caption": caption,
-            "caption_source": "pages-paragraph" if caption else "not-found",
+            "caption_source": "editorial-after-photo" if caption else "not-found",
             "filename": filename,
             "source_page": source_url,
         })
