@@ -190,58 +190,57 @@ def extract_main_intro(soup):
 
 
 def extract_photo_editorial_text(figure):
-    """Extract ONLY the long editorial text directly below this photo.
+    """Return the editorial paragraph belonging to this exact gallery photo.
 
-    The KapanLagi gallery structure is:
+    KapanLagi's photo item is consistently:
       <figure class="pages-img">...</figure>
-      <div class="pages-paragraph ..."><p>LONG TEXT</p></div>
+      <!--STARTOFPAGEDESCRIPTIONBOTTOM-->
+      <div class="pages-paragraph ..."><p>...</p></div>
 
-    `img alt` and `figcaption` are deliberately never used.
+    IMPORTANT: alt text and figcaption/credit are NEVER caption sources.
     """
     if not figure:
         return ""
 
     box_body = figure.find_parent("div", class_="box-body")
-    if not box_body:
-        return ""
 
-    # 1. Exact DOM relationship: the first pages-paragraph after this figure,
-    #    while still inside the same box-body.
-    for node in figure.next_elements:
+    # Strategy A: walk the DOM after this figure. Stop at the next photo.
+    # This deliberately does NOT require the paragraph to be a direct sibling.
+    for node in figure.find_all_next():
+        if getattr(node, "name", None) == "figure" and "pages-img" in (node.get("class") or []):
+            break
         if getattr(node, "name", None) == "div" and "pages-paragraph" in (node.get("class") or []):
-            if node.find_parent("div", class_="box-body") is box_body:
+            if box_body is None or node.find_parent("div", class_="box-body") is box_body:
                 text = clean_text(node.get_text(" ", strip=True))
-                if text:
+                if text and not CREDIT_RE.match(text):
                     return text
-            break
 
-        # Do not cross into another photo/container.
-        if getattr(node, "name", None) == "figure" and node is not figure:
-            break
-
-    # 2. Direct children / descendants in the same box-body. This handles
-    #    responses where BeautifulSoup's traversal differs around comments.
-    candidates = box_body.select("div.pages-paragraph")
-    for candidate in candidates:
-        previous_figure = candidate.find_previous("figure", class_="pages-img")
-        if previous_figure is figure:
-            text = clean_text(candidate.get_text(" ", strip=True))
-            if text:
-                return text
+    # Strategy B: inspect every paragraph in the same box and bind it to the
+    # immediately preceding gallery figure. This handles unusual DOM nesting.
+    if box_body is not None:
+        for candidate in box_body.select(".pages-paragraph"):
+            prev = candidate.find_previous("figure", class_="pages-img")
+            if prev is figure:
+                text = clean_text(candidate.get_text(" ", strip=True))
+                if text and not CREDIT_RE.match(text):
+                    return text
 
     return ""
 
 
 def extract_photo_editorial_text_from_page_html(page_html):
-    """Raw-HTML fallback for KapanLagi's exact figure -> description pattern."""
+    """Raw HTML parser for KapanLagi's figure -> editorial paragraph."""
     if not page_html:
         return ""
 
-    # Exact marker-based pattern from KapanLagi source.
+    # First, split the raw item at the exact KapanLagi marker when present.
+    # We intentionally allow arbitrary whitespace/comments/HTML between the
+    # figure and paragraph because ads/formatting can vary between responses.
     m = re.search(
-        r'<figure\b[^>]*class=["\'][^"\']*pages-img[^"\']*["\'][\s\S]*?</figure>\s*'
-        r'(?:<!--\s*STARTOFPAGEDESCRIPTIONBOTTOM\s*-->\s*)?'
-        r'<div\b[^>]*class=["\'][^"\']*pages-paragraph[^"\']*["\'][^>]*>([\s\S]*?)</div>',
+        r'<figure\b[^>]*class=["\'][^"\']*\bpages-img\b[^"\']*["\'][\s\S]*?</figure>'
+        r'[\s\S]*?'
+        r'<div\b[^>]*class=["\'][^"\']*\bpages-paragraph\b[^"\']*["\'][^>]*>'
+        r'([\s\S]*?)</div>',
         page_html,
         re.I,
     )
@@ -249,7 +248,10 @@ def extract_photo_editorial_text_from_page_html(page_html):
         return ""
 
     frag = BeautifulSoup(m.group(1), "html.parser")
-    return clean_text(frag.get_text(" ", strip=True))
+    text = clean_text(frag.get_text(" ", strip=True))
+    if text and not CREDIT_RE.match(text):
+        return text
+    return ""
 
 def parse_gallery_html(html, source_url, photos, seen):
     soup = BeautifulSoup(html, "html.parser")
