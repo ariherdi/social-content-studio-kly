@@ -3,7 +3,7 @@ import io
 import os
 import re
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 import streamlit as st
@@ -267,6 +267,79 @@ def extract_photo_editorial_text(figure):
     return ""
 
 
+def extract_photo_detail_url(figure, page, base_url, filename):
+    """Find the dedicated KapanLagi photo-detail URL for this image.
+
+    KapanLagi can expose each gallery image as its own /foto/.../*.html page.
+    Those detail pages contain the editorial paragraph even when the gallery
+    wrapper returned to a crawler does not.
+    """
+    candidates = []
+
+    def add_href(href):
+        if not href:
+            return
+        u = urljoin(base_url, href.strip())
+        low = u.lower()
+        if 'kapanlagi.com/foto/' not in low:
+            return
+        if filename and filename.lower() not in low:
+            # Still allow /foto/... detail URLs, but score exact filename higher.
+            candidates.append((1, u))
+        else:
+            candidates.append((10, u))
+
+    if figure:
+        for a in figure.find_all_previous('a', href=True, limit=8):
+            add_href(a.get('href'))
+        for a in figure.find_all_next('a', href=True, limit=8):
+            add_href(a.get('href'))
+        parent = figure.find_parent('a', href=True)
+        if parent:
+            add_href(parent.get('href'))
+
+    if page:
+        for a in page.select('a[href]'):
+            add_href(a.get('href'))
+
+    if not candidates:
+        return ''
+    # Prefer URLs that contain the exact image filename.
+    candidates.sort(key=lambda x: (x[0], -len(x[1])), reverse=True)
+    return candidates[0][1]
+
+
+def extract_caption_from_detail_html(html, filename):
+    """Extract the single photo caption from a dedicated photo-detail page."""
+    if not html:
+        return ''
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # First anchor on the exact image, then follow document flow until a
+    # meaningful editorial paragraph is encountered. There is only one gallery
+    # image on a dedicated photo page, so no gallery-boundary ambiguity exists.
+    target = None
+    if filename:
+        for img in soup.find_all('img'):
+            srcs = [img.get(k, '') for k in ('src', 'data-src', 'data-original', 'data-lazy-src')]
+            if any(filename in (x or '') for x in srcs):
+                target = img
+                break
+    if target:
+        for node in target.next_elements:
+            cand = _caption_candidate(node)
+            if cand:
+                return cand[1]
+
+    # Raw filename fallback.
+    if filename:
+        raw = extract_caption_from_raw_html(html, filename)
+        if raw:
+            return raw
+
+    return ''
+
+
 def extract_caption_from_raw_html(html, filename):
     """Raw HTML fallback keyed to the actual photo filename.
 
@@ -392,6 +465,25 @@ def parse_gallery_html(html, source_url, photos, seen):
             if caption:
                 caption_source = "document flow fallback"
 
+        # Final source-specific fallback: fetch the dedicated photo page.
+        # This is important because KapanLagi exposes gallery photos as
+        # individual /foto/.../*.html pages in some responses.
+        detail_url = extract_photo_detail_url(figure, page, source_url, filename)
+        if detail_url:
+            try:
+                detail_html, detail_diag = fetch_html(detail_url)
+                diag.setdefault("detail_fetches", 0)
+                diag["detail_fetches"] += 1
+                if not caption:
+                    caption = extract_caption_from_detail_html(detail_html, filename)
+                    if caption:
+                        caption_source = "dedicated photo page"
+                if caption:
+                    diag.setdefault("detail_captions", 0)
+                    diag["detail_captions"] += 1
+            except Exception as e:
+                diag.setdefault("detail_errors", []).append(str(e))
+
         if caption:
             diag["editorial_captions"] += 1
 
@@ -405,6 +497,7 @@ def parse_gallery_html(html, source_url, photos, seen):
             "source_page": source_url,
             "caption_source": caption_source,
             "caption_debug": debug,
+            "detail_url": detail_url,
         })
 
     # Diagnostic fallback for unusual responses without content-pages wrappers.
