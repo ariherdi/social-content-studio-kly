@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Comment
 from PIL import Image, ImageDraw, ImageFont
 
 try:
@@ -190,46 +190,55 @@ def extract_main_intro(soup):
 
 
 def extract_photo_editorial_text(figure):
-    """Extract ONLY the long editorial text immediately following a photo figure.
+    """Extract the editorial paragraph belonging to THIS photo.
 
-    KapanLagi structure:
-      <figure class="pages-img">...</figure>
-      <!--STARTOFPAGEDESCRIPTIONBOTTOM-->
-      <div class="pages-paragraph ..."><p>EDITORIAL TEXT</p></div>
-      <!--ENDOFPAGEDESCRIPTIONBOTTOM-->
+    KapanLagi's photo body is deliberately parsed by DOM position:
+        figure.pages-img
+        STARTOFPAGEDESCRIPTIONBOTTOM
+        div.pages-paragraph
+        ENDOFPAGEDESCRIPTIONBOTTOM
 
-    The figcaption/pages-img-desc is a photo credit and must never be used as
-    the editorial caption. img[alt] is only a last-resort fallback.
+    The figcaption/pages-img-desc is only the photo credit and is never used.
     """
     if not figure:
         return ""
 
-    # 1) Most precise: inspect the immediate DOM sequence after the figure.
+    # First, use the exact marker immediately following the figure.
     node = figure.next_sibling
+    saw_start_marker = False
     while node is not None:
-        if isinstance(node, NavigableString):
-            node = node.next_sibling
-            continue
-
-        if getattr(node, "name", None) == "div" and "pages-paragraph" in (node.get("class") or []):
-            return clean_text(node.get_text(" ", strip=True))
-
-        # Stop when another major content block begins. This prevents a caption
-        # from one photo being accidentally assigned to the previous photo.
-        if getattr(node, "name", None) == "div":
-            cls = set(node.get("class") or [])
-            if "box" in cls or "pages-item" in cls:
+        if isinstance(node, Comment):
+            marker = str(node).strip().upper()
+            if marker == "STARTOFPAGEDESCRIPTIONBOTTOM":
+                saw_start_marker = True
+            elif marker == "ENDOFPAGEDESCRIPTIONBOTTOM" and saw_start_marker:
+                break
+        elif getattr(node, "name", None) == "div":
+            classes = set(node.get("class") or [])
+            if saw_start_marker and "pages-paragraph" in classes:
+                text = clean_text(node.get_text(" ", strip=True))
+                if text:
+                    return text
+            # A pages-paragraph without the marker is still valid when it is
+            # the immediate sibling after the figure.
+            if not saw_start_marker and "pages-paragraph" in classes:
+                text = clean_text(node.get_text(" ", strip=True))
+                if text:
+                    return text
+            if "box" in classes or "pages-item" in classes:
                 break
         node = node.next_sibling
 
-    # 2) Robust fallback: within the same .box-body, choose the first
-    # .pages-paragraph whose preceding figure is THIS exact figure.
-    box_body = figure.find_parent(class_="box-body")
+    # Second, search ONLY inside this photo's box-body and require that the
+    # candidate's nearest preceding figure is the same figure.
+    box_body = figure.find_parent("div", class_="box-body")
     if box_body:
         for candidate in box_body.select(".pages-paragraph"):
-            prev = candidate.find_previous("figure", class_="pages-img")
-            if prev is figure:
-                return clean_text(candidate.get_text(" ", strip=True))
+            previous_figure = candidate.find_previous("figure", class_="pages-img")
+            if previous_figure is figure:
+                text = clean_text(candidate.get_text(" ", strip=True))
+                if text:
+                    return text
 
     return ""
 
