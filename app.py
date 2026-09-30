@@ -84,14 +84,41 @@ def fetch_html(url):
 def filename_from_url(u):
     return os.path.basename(urlparse(u).path)
 
+def normalize_candidate_url(u):
+    if not u:
+        return ""
+    u = str(u).strip().replace("&amp;", "&")
+    if u.startswith("//"):
+        u = "https:" + u
+    return u.split("?")[0].strip()
+
+
+def filename_from_url(u):
+    return os.path.basename(urlparse(normalize_candidate_url(u)).path)
+
+
+def looks_like_article_filename(filename):
+    """KapanLagi gallery filenames carry an 8-digit YYYYMMDD date."""
+    if not filename or not re.search(r"\.(jpg|jpeg|png|webp)$", filename, re.I):
+        return False
+    if not re.search(r"(?<!\d)(?:19|20)\d{6}(?!\d)", filename):
+        return False
+    return True
+
+
 def is_article_image(u):
+    """Accept KapanLagi image variants, not only /resized/ URLs.
+
+    The live Streamlit response can rewrite/remove the original CDN path while
+    retaining the article filename. Filename/date is therefore the stronger
+    identifier for this gallery.
+    """
+    u = normalize_candidate_url(u)
     if not u:
         return False
-    u = u.split("?")[0].strip()
-    return (
-        "cdns.klimg.com/resized/" in u
-        and bool(re.search(r"\.(jpg|jpeg|png|webp)$", u, re.I))
-    )
+    f = filename_from_url(u)
+    return looks_like_article_filename(f)
+
 
 def original_url(resized_url):
     """Build KapanLagi full-resolution download URL from filename date."""
@@ -105,35 +132,130 @@ def original_url(resized_url):
         f"download/g/{d[:4]}/{d[4:6]}/{d[6:8]}/r/{f}"
     )
 
+
 def extract_img_url(img):
-    """Get the KapanLagi resized image URL from common lazy-loading attributes."""
-    attrs = ["data-src", "data-original", "data-lazy-src", "src"]
+    """Extract the most useful image URL from common and rewritten attrs."""
+    attrs = ["data-src", "data-original", "data-lazy-src", "data-url", "src"]
     for key in attrs:
-        v = img.get(key)
-        if is_article_image(v):
-            return v.split("?")[0]
+        v = normalize_candidate_url(img.get(key))
+        if v and is_article_image(v):
+            return v
 
     for key in ("data-srcset", "srcset"):
         raw = img.get(key, "")
         if raw:
-            # Prefer the largest candidate in srcset.
             candidates = []
             for part in raw.split(","):
                 bits = part.strip().split()
                 if not bits:
                     continue
-                u = bits[0]
+                u = normalize_candidate_url(bits[0])
                 if is_article_image(u):
                     score = 0
                     if len(bits) > 1:
                         m = re.match(r"(\d+)w", bits[1])
                         if m:
                             score = int(m.group(1))
-                    candidates.append((score, u.split("?")[0]))
+                    candidates.append((score, u))
             if candidates:
                 candidates.sort(reverse=True)
-                return candidates[0][1]
+                return candidates[-1][1] if candidates[0][0] == 0 else candidates[0][1]
     return ""
+
+
+def extract_article_image_urls_raw(page_html):
+    """Find gallery image URLs from the raw response even when KapanLagi wrappers change."""
+    soup = BeautifulSoup(page_html or "", "html.parser")
+    urls, seen = [], set()
+
+    for img in soup.find_all("img"):
+        u = extract_img_url(img)
+        if not u:
+            # Some server variants leave the URL only in arbitrary data attrs.
+            for key, val in img.attrs.items():
+                if not isinstance(val, str):
+                    continue
+                m = re.search(r"https?://[^\\\"'<>\\s]+\\.(?:jpg|jpeg|png|webp)(?:\\?[^\\\"'<>\\s]*)?", val, re.I)
+                if m and is_article_image(m.group(0)):
+                    u = normalize_candidate_url(m.group(0))
+                    break
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    # Last-resort raw URL scan catches HTML/JSON where img tags are absent.
+    if not urls:
+        for m in re.finditer(r"https?://[^\"'<>\s]+\.(?:jpg|jpeg|png|webp)(?:\?[^\"'<>\s]*)?", page_html or "", re.I):
+            u = normalize_candidate_url(m.group(0))
+            if is_article_image(u) and u not in seen:
+                seen.add(u)
+                urls.append(u)
+
+    return urls
+
+
+def caption_candidates_near_image(soup, target_img):
+    """Collect editorial text between this image and the next gallery image.
+
+    In the stripped live response there may be no KapanLagi CSS classes or
+    HTML comments. The safest association is therefore DOM order: the first
+    qualifying paragraph after an article image belongs to that image.
+    """
+    article_imgs = [im for im in soup.find_all("img") if extract_img_url(im)]
+    next_article = None
+    try:
+        idx = article_imgs.index(target_img)
+        if idx + 1 < len(article_imgs):
+            next_article = article_imgs[idx + 1]
+    except ValueError:
+        pass
+
+    def valid(text):
+        if len(text) < 60 or len(text) > 900:
+            return False
+        low = text.lower()
+        if any(x in low for x in ["advertisement", "scroll untuk melanjutkan", "google_ads", "copyright"]):
+            return False
+        if CREDIT_RE.match(text):
+            return False
+        return "." in text
+
+    # First pass: real paragraphs. This is the most reliable signal and keeps
+    # the photo/caption pairing strictly positional.
+    for node in target_img.find_all_next("p"):
+        if next_article is not None and (node is next_article or next_article in node.parents):
+            break
+        if node.find("img"):
+            continue
+        text = clean_text(node.get_text(" ", strip=True))
+        if valid(text):
+            return [(2000 + min(len(text), 500), text)]
+
+    # Second pass: paragraph-like containers for unusual markup.
+    for node in target_img.find_all_next(["div", "section", "article"]):
+        if next_article is not None and (node is next_article or next_article in node.parents):
+            break
+        if node.find("img"):
+            continue
+        text = clean_text(node.get_text(" ", strip=True))
+        if valid(text):
+            return [(1000 + min(len(text), 500), text)]
+
+    return []
+
+def extract_caption_by_filename(page_html, filename):
+    """Fallback caption extraction for responses without KapanLagi marker/classes."""
+    soup = BeautifulSoup(page_html or "", "html.parser")
+    target = None
+    for img in soup.find_all("img"):
+        attrs = [img.get(k, "") for k in ("src", "data-src", "data-original", "data-lazy-src", "data-url", "srcset", "data-srcset")]
+        if any(filename in str(v) for v in attrs):
+            target = img
+            break
+    if target is None:
+        return ""
+    cands = caption_candidates_near_image(soup, target)
+    return cands[0][1] if cands else ""
 
 def page_urls_from_soup(soup, base_url):
     urls = []
@@ -247,24 +369,8 @@ def extract_gallery_images_raw(page_html):
     urls = []
     seen = set()
 
-    pages = soup.select(".pages-item[data-type='content-pages']")
-    if pages:
-        for page in pages:
-            img = page.select_one("figure.pages-img img") or page.find("img")
-            if not img:
-                continue
-            u = extract_img_url(img)
-            if is_article_image(u) and u not in seen:
-                seen.add(u)
-                urls.append(u)
-        return urls
-
-    for img in soup.select("figure.pages-img img"):
-        u = extract_img_url(img)
-        if is_article_image(u) and u not in seen:
-            seen.add(u)
-            urls.append(u)
-    return urls
+    # Do not depend on .pages-item / figure classes; the live response can omit them.
+    return extract_article_image_urls_raw(page_html)
 
 
 def extract_photo_editorial_text(figure):
@@ -318,10 +424,40 @@ def parse_gallery_html(html, source_url, photos, seen):
         "article_images": 0,
         "editorial_captions": 0,
         "caption_blocks_raw": len(extract_caption_blocks_raw(html)),
+        "raw_dated_images": len(extract_article_image_urls_raw(html)),
         "pairing": "positional",
     }
 
     raw_captions = extract_caption_blocks_raw(html)
+
+    # New V24 path: identify dated KapanLagi filenames first. This works even
+    # when the live response has no pages-item, figure, or marker comments.
+    raw_article_urls = extract_article_image_urls_raw(html)
+    if raw_article_urls:
+        for idx, resized in enumerate(raw_article_urls):
+            filename = filename_from_url(resized)
+            original = original_url(resized)
+            if not filename or not original or original in seen:
+                continue
+            caption = ""
+            if idx < len(raw_captions):
+                caption = raw_captions[idx]
+            if not caption:
+                caption = extract_caption_by_filename(html, filename)
+            seen.add(original)
+            diag["article_images"] += 1
+            if caption:
+                diag["editorial_captions"] += 1
+            photos.append({
+                "resized": resized,
+                "original": original,
+                "caption": caption,
+                "filename": filename,
+                "source_page": source_url,
+                "caption_source": "KapanLagi marker/order" if caption else "NOT FOUND",
+            })
+        if photos:
+            return diag, soup
 
     # Best path: process each content-page independently. This guarantees
     # caption #1 belongs to photo #1 even if the page contains ad markup.
