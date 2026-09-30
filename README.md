@@ -77,3 +77,14 @@ KapanLagi dapat memiliki URL CDN seperti:
 tetapi atribut HTML-nya dapat berupa `width="375" height="514"` karena ukuran tersebut adalah ukuran display halaman, bukan ukuran sumber CDN.
 
 V8 menggunakan ukuran pada URL CDN (`670x`) untuk menentukan apakah foto termasuk foto besar. Jadi foto gallery 670x tetap diambil meskipun display HTML-nya 375px.
+
+
+## V9 — Bugfix extractor
+
+V8 memiliki bug escaping pada regex pembaca ukuran CDN. Pola:
+
+`/resized/670x/`
+
+sekarang dibaca dengan regex yang benar sehingga `670` terdeteksi sebagai ukuran CDN.
+
+Atribut `width="375"` pada HTML tetap tidak digunakan untuk menolak foto karena itu adalah ukuran display, bukan ukuran sumber CDN.

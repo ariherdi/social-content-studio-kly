@@ -282,7 +282,7 @@ def extract_page(url):
         # attributes such as 375x514 even though the CDN source is a large
         # 670x image. Therefore the "large image" test MUST use the CDN
         # resize segment (e.g. /resized/670x/), not the HTML display size.
-        resize_match = re.search(r"/resized/(\\d+)x(?:/|$)", src, re.I)
+        resize_match = re.search(r"/resized/(\d+)x(?:/|$)", src, re.I)
         resize_width = int(resize_match.group(1)) if resize_match else 0
 
         try:
