@@ -190,58 +190,55 @@ def extract_main_intro(soup):
 
 
 def extract_photo_editorial_text(figure):
-    """Extract the editorial paragraph belonging to THIS photo.
+    """Return ONLY the long editorial text belonging to this photo.
 
-    KapanLagi's photo body is deliberately parsed by DOM position:
-        figure.pages-img
-        STARTOFPAGEDESCRIPTIONBOTTOM
-        div.pages-paragraph
-        ENDOFPAGEDESCRIPTIONBOTTOM
+    KapanLagi photo pages have this exact sequence inside each photo box:
+        <figure class="pages-img">...</figure>
+        <!--STARTOFPAGEDESCRIPTIONBOTTOM-->
+        <div class="pages-paragraph ..."><p>LONG EDITORIAL TEXT</p></div>
+        <!--ENDOFPAGEDESCRIPTIONBOTTOM-->
 
-    The figcaption/pages-img-desc is only the photo credit and is never used.
+    IMPORTANT: img[alt] and figcaption/pages-img-desc are NOT captions.
+    If the editorial paragraph cannot be found, return an empty string.
+    Never fall back to the short image alt because that produces the wrong
+    value for this tool's "Caption asli" field.
     """
     if not figure:
         return ""
 
-    # First, use the exact marker immediately following the figure.
-    node = figure.next_sibling
-    saw_start_marker = False
-    while node is not None:
-        if isinstance(node, Comment):
-            marker = str(node).strip().upper()
-            if marker == "STARTOFPAGEDESCRIPTIONBOTTOM":
-                saw_start_marker = True
-            elif marker == "ENDOFPAGEDESCRIPTIONBOTTOM" and saw_start_marker:
-                break
-        elif getattr(node, "name", None) == "div":
-            classes = set(node.get("class") or [])
-            if saw_start_marker and "pages-paragraph" in classes:
-                text = clean_text(node.get_text(" ", strip=True))
-                if text:
-                    return text
-            # A pages-paragraph without the marker is still valid when it is
-            # the immediate sibling after the figure.
-            if not saw_start_marker and "pages-paragraph" in classes:
-                text = clean_text(node.get_text(" ", strip=True))
-                if text:
-                    return text
-            if "box" in classes or "pages-item" in classes:
-                break
-        node = node.next_sibling
-
-    # Second, search ONLY inside this photo's box-body and require that the
-    # candidate's nearest preceding figure is the same figure.
+    # Most robust path: the first pages-paragraph after THIS figure,
+    # constrained to the same box-body. This does not depend on HTML comments
+    # surviving the server/proxy response.
     box_body = figure.find_parent("div", class_="box-body")
     if box_body:
-        for candidate in box_body.select(".pages-paragraph"):
+        candidate = figure.find_next("div", class_="pages-paragraph")
+        if candidate and candidate.find_parent("div", class_="box-body") is box_body:
+            text = clean_text(candidate.get_text(" ", strip=True))
+            if text:
+                return text
+
+        # DOM-order fallback: choose a paragraph whose nearest preceding
+        # pages-img figure is exactly this figure.
+        for candidate in box_body.select("div.pages-paragraph"):
             previous_figure = candidate.find_previous("figure", class_="pages-img")
             if previous_figure is figure:
                 text = clean_text(candidate.get_text(" ", strip=True))
                 if text:
                     return text
 
-    return ""
+    # Last fallback for unusual markup: immediate sibling after figure.
+    # Still NEVER use img alt or figcaption.
+    node = figure.next_sibling
+    while node is not None:
+        if getattr(node, "name", None) == "div" and "pages-paragraph" in set(node.get("class") or []):
+            text = clean_text(node.get_text(" ", strip=True))
+            if text:
+                return text
+        if getattr(node, "name", None) == "div" and "box" in set(node.get("class") or []):
+            break
+        node = node.next_sibling
 
+    return ""
 
 def parse_gallery_html(html, source_url, photos, seen):
     soup = BeautifulSoup(html, "html.parser")
@@ -281,13 +278,11 @@ def parse_gallery_html(html, source_url, photos, seen):
         diag["article_images"] += 1
         seen.add(original)
 
-        # Editorial text is the PRIMARY source. Do not use figcaption/credit.
+        # Caption asli MUST be the long editorial paragraph below the photo.
+        # Never use img[alt] or figcaption as a fallback.
         caption = extract_photo_editorial_text(figure)
         if caption:
             diag["editorial_captions"] += 1
-        else:
-            # Only when the long editorial text is genuinely absent, use alt.
-            caption = clean_text(img.get("alt", ""))
 
         photos.append({
             "resized": resized,
@@ -311,7 +306,7 @@ def parse_gallery_html(html, source_url, photos, seen):
             photos.append({
                 "resized": resized,
                 "original": original,
-                "caption": clean_text(img.get("alt", "")),
+                "caption": "",
                 "filename": filename,
                 "source_page": source_url,
             })
