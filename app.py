@@ -1,286 +1,168 @@
-import io, re
-from urllib.parse import urljoin, urlparse
+import io,re,zipfile,html as html_lib
+from pathlib import Path
+from urllib.parse import urljoin,urlparse
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image,ImageDraw,ImageFont
 import streamlit as st
 
-st.set_page_config(page_title='Social Content Studio', page_icon='📲', layout='wide')
+st.set_page_config(page_title="Social Content Studio",page_icon="📸",layout="wide")
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140 Safari/537.36"
 
-UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36'
+def clean(s): return re.sub(r"\s+"," ",html_lib.unescape(s or "")).strip()
+def fname(u): return Path(urlparse(u).path).name
 
+def original_url(u):
+    f=fname(u); m=re.search(r"(?<!\d)((?:19|20)\d{6})(?!\d)",f)
+    if not m:return None
+    d=m.group(1)
+    return f"https://cdns.klimg.com/kapanlagi.com/download/g/{d[:4]}/{d[4:6]}/{d[6:8]}/r/{f}"
 
-def clean_text(text):
-    return re.sub(r'\s+', ' ', text or '').strip()
+def strip_credit(t):
+    t=re.sub(r"\s*(?:Foto|Dok|Credit|Sumber)\s*:\s*[^|]+$","",t,flags=re.I)
+    t=re.sub(r"\s*©\s*[^|]+$","",t)
+    return clean(t)
 
-
-def is_kapanlagi(url):
-    host = urlparse(url).netloc.lower()
-    return host.endswith('kapanlagi.com') or host.endswith('kapanlagi.com.')
-
-
-def image_url_from_tag(img, base_url):
-    # Prefer high-resolution/lazy attributes used by modern news sites.
-    attrs = [
-        'data-original', 'data-src', 'data-lazy-src', 'data-image',
-        'data-srcset', 'srcset', 'src'
-    ]
-    for attr in attrs:
-        val = img.get(attr)
-        if not val:
-            continue
-        if attr in ('srcset', 'data-srcset'):
-            # Pick the last/largest candidate in srcset.
-            candidates = [x.strip().split(' ')[0] for x in val.split(',') if x.strip()]
-            if candidates:
-                val = candidates[-1]
-        if val.startswith('data:'):
-            continue
-        return urljoin(base_url, val)
-    return ''
-
-
-def image_is_large(img):
-    try:
-        w = int(re.sub(r'[^0-9]', '', str(img.get('width', '')))) if img.get('width') else 0
-        h = int(re.sub(r'[^0-9]', '', str(img.get('height', '')))) if img.get('height') else 0
-        if w >= 500 or h >= 350:
-            return True
-    except Exception:
-        pass
-    src = image_url_from_tag(img, '')
-    # KapanLagi CDN image URLs are generally the actual editorial assets.
-    return 'cdns.klimg.com' in src.lower()
-
-
-def nearby_caption(img):
-    """Find caption immediately below/near an image, avoiding credits and UI text."""
-    fig = img.find_parent('figure')
-    if fig:
-        cap = fig.find('figcaption')
-        if cap:
-            text = clean_text(cap.get_text(' ', strip=True))
-            if text and not text.lower().startswith(('hak cipta', 'copyright')):
-                return text
-
-    # Prefer a sibling paragraph immediately following the image/container.
-    node = img
+def caption(img):
+    p=img
     for _ in range(4):
-        node = node.find_next_sibling()
-        if not node:
-            break
-        text = clean_text(node.get_text(' ', strip=True))
-        if not text:
-            continue
-        low = text.lower()
-        if low.startswith(('hak cipta', 'copyright', 'prev', 'next')):
-            continue
-        # Avoid swallowing navigation or article-wide text.
-        if len(text) <= 500:
-            return text
-    return ''
+        p=getattr(p,"parent",None)
+        if not p: break
+        n=p.find("figcaption")
+        if n:
+            t=strip_credit(n.get_text(" ",strip=True))
+            if t:return t
+    p=img.parent
+    for _ in range(3):
+        if not p:break
+        for n in p.find_all(["p","div","span"],limit=15):
+            cls=" ".join(n.get("class",[]))
+            if re.search(r"caption|photo.?caption|image.?caption|keterangan",cls,re.I):
+                t=strip_credit(n.get_text(" ",strip=True))
+                if len(t)>8:return t
+        p=p.parent
+    a=clean(img.get("alt",""))
+    return strip_credit(a) if len(a)>8 else ""
 
+@st.cache_data(ttl=3600,show_spinner=False)
+def fetch(u):
+    r=requests.get(u,headers={"User-Agent":UA},timeout=25);r.raise_for_status()
+    return r.text,r.url
 
-def kapanlagi_extract(soup, url):
-    # Remove obvious non-content areas before analysis.
-    for tag in soup(['script', 'style', 'noscript', 'svg', 'iframe']):
-        tag.decompose()
-
-    h1 = soup.find('h1')
-    title = clean_text(h1.get_text(' ', strip=True)) if h1 else ''
-    if not title:
-        meta = soup.find('meta', property='og:title')
-        title = clean_text(meta.get('content')) if meta else ''
-
-    # Find intro: first meaningful paragraph after the H1 and before the first editorial image.
-    intro = ''
-    if h1:
-        for node in h1.find_all_next(['p', 'div']):
-            if node.name == 'div' and node.find('img'):
-                break
-            text = clean_text(node.get_text(' ', strip=True))
-            if len(text) >= 40 and not text.lower().startswith(('diterbitkan', 'oleh')):
-                intro = text
-                break
-
-    # Find candidate editorial images. KapanLagi photo pages use klimg CDN assets.
-    candidates = []
-    if h1:
-        nodes = h1.find_all_next('img')
-    else:
-        nodes = soup.find_all('img')
-
-    for img in nodes:
-        src = image_url_from_tag(img, url)
-        if not src or 'cdns.klimg.com' not in src.lower():
-            continue
-        if not image_is_large(img):
-            continue
-        alt = clean_text(img.get('alt'))
-        caption = nearby_caption(img)
-        # Score image based on editorial characteristics.
-        score = 0
-        if caption:
-            score += 5
-        if alt:
-            score += 1
-        parent_text = clean_text(img.parent.get_text(' ', strip=True)) if img.parent else ''
-        if len(parent_text) < 300:
-            score += 1
-        candidates.append({'url': src, 'alt': alt, 'caption': caption, 'score': score})
-
-    # Deduplicate and remove obvious repeated assets.
-    clean = []
-    seen = set()
-    for item in sorted(candidates, key=lambda x: -x['score']):
-        key = item['url'].split('?')[0]
-        if key in seen:
-            continue
-        seen.add(key)
-        clean.append(item)
-
-    # Preserve page order rather than score order.
-    order = {item['url'].split('?')[0]: i for i, item in enumerate(candidates)}
-    clean.sort(key=lambda x: order.get(x['url'].split('?')[0], 99999))
-
-    # Remove obvious tiny/UI assets by filename hints.
-    filtered = []
-    for item in clean:
-        low = item['url'].lower()
-        if any(x in low for x in ['/logo', '/icon', '/avatar', '/placeholder', 'sprite']):
-            continue
-        filtered.append(item)
-
-    return {'title': title, 'intro': intro, 'images': filtered[:30], 'source': 'KapanLagi'}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_article(url):
-    r = requests.get(url, headers={'User-Agent': UA}, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, 'html.parser')
-    if is_kapanlagi(url):
-        return kapanlagi_extract(soup, url)
-
-    # Generic fallback for non-KapanLagi URLs.
-    for tag in soup(['script', 'style', 'noscript', 'svg', 'iframe']):
-        tag.decompose()
-    title_tag = soup.find('meta', property='og:title') or soup.find('title')
-    title = clean_text(title_tag.get('content') if hasattr(title_tag, 'get') else title_tag.get_text(' ', strip=True) if title_tag else '')
-    imgs = []
-    for img in soup.find_all('img'):
-        src = image_url_from_tag(img, url)
-        if not src or not image_is_large(img):
-            continue
-        imgs.append({'url': src, 'alt': clean_text(img.get('alt')), 'caption': nearby_caption(img)})
-    seen = set(); clean = []
-    for x in imgs:
-        if x['url'] not in seen:
-            seen.add(x['url']); clean.append(x)
-    return {'title': title, 'intro': '', 'images': clean[:30], 'source': 'Generic'}
-
-
-def short_copy(text, title=''):
-    text = clean_text(text)
-    if not text:
-        text = title
-    text = re.sub(r'\b(?:Foto|Dok|Sumber|Hak Cipta)\s*:\s*[^.]+\.?', '', text, flags=re.I).strip()
-    words = text.split()
-    if len(words) > 9:
-        text = ' '.join(words[:9])
-    return text.rstrip(' ,.-')
-
-
-def load_image(url):
-    r = requests.get(url, headers={'User-Agent': UA}, timeout=25)
-    r.raise_for_status()
-    return Image.open(io.BytesIO(r.content)).convert('RGB')
-
-
-def make_card(img, text):
-    w, h = 1080, 1080
-    img.thumbnail((w, h))
-    canvas = Image.new('RGB', (w, h), '#111111')
-    x = (w - img.width) // 2; y = (h - img.height) // 2
-    canvas.paste(img, (x, y))
-    draw = ImageDraw.Draw(canvas, 'RGBA')
-    box_h = 250
-    draw.rectangle((0, h-box_h, w, h), fill=(0, 0, 0, 185))
-    try:
-        font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 58)
-    except Exception:
-        font = ImageFont.load_default()
-    lines=[]; cur=''
-    for word in text.split():
-        test=(cur+' '+word).strip()
-        if draw.textbbox((0,0), test, font=font)[2] > w-100 and cur:
-            lines.append(cur); cur=word
-        else: cur=test
-    if cur: lines.append(cur)
-    total=sum(draw.textbbox((0,0),ln,font=font)[3] for ln in lines)+(len(lines)-1)*10
-    yy=h-box_h+(box_h-total)//2
-    for ln in lines:
-        bbox=draw.textbbox((0,0),ln,font=font); tw=bbox[2]-bbox[0]
-        draw.text(((w-tw)//2,yy),ln,font=font,fill='white'); yy+=bbox[3]-bbox[1]+10
-    out=io.BytesIO(); canvas.save(out,format='PNG'); out.seek(0); return out
-
-
-st.title('📲 Social Content Studio')
-st.caption('POC V2 — KapanLagi: intro + foto editorial besar + caption foto → copy pendek → preview → download')
-
-url=st.text_input('URL Artikel', placeholder='https://www.kapanlagi.com/foto/berita-foto/...')
-if st.button('🔎 Analisis Artikel', type='primary'):
-    if not url.startswith(('http://','https://')):
-        st.error('Masukkan URL lengkap yang diawali http:// atau https://')
-    elif not is_kapanlagi(url):
-        st.warning('POC V2 saat ini difokuskan untuk KapanLagi.com. URL lain masih memakai extractor generik.')
-        try:
-            with st.spinner('Membaca artikel...'):
-                st.session_state.article=fetch_article(url)
-        except Exception as e:
-            st.error(f'Gagal membaca URL: {e}')
-    else:
-        try:
-            with st.spinner('Membaca struktur foto KapanLagi...'):
-                st.session_state.article=fetch_article(url)
-        except Exception as e:
-            st.error(f'Gagal membaca URL: {e}')
-
-article=st.session_state.get('article')
-if article:
-    st.divider()
-    st.subheader(article['title'] or 'Artikel')
-    st.caption(f"Extractor: {article.get('source','Generic')}")
-
-    st.markdown('### 📝 Intro / Deskripsi Artikel')
-    intro=st.text_area('Intro', value=article.get('intro',''), key='article_intro', height=110)
+def extract(u):
+    html,final=fetch(u);s=BeautifulSoup(html,"html.parser")
+    h=s.find("h1");title=clean(h.get_text(" ",strip=True)) if h else ""
+    intro=""
+    for attrs in [{"name":"description"},{"property":"og:description"},{"name":"twitter:description"}]:
+        n=s.find("meta",attrs=attrs)
+        if n and len(clean(n.get("content")))>40: intro=clean(n["content"]);break
     if not intro:
-        st.warning('Intro belum terdeteksi otomatis.')
+        main=s.find("article") or s.find("main") or s.body
+        for p in main.find_all("p") if main else []:
+            t=clean(p.get_text(" ",strip=True))
+            if len(t)>50 and not re.search(r"cookie|newsletter",t,re.I): intro=t;break
+    photos=[];seen=set()
+    for img in s.find_all("img"):
+        cand=[]
+        for a in ("src","data-src","data-original","data-lazy-src"):
+            if img.get(a):cand.append(urljoin(final,img[a]))
+        for u2 in cand:
+            if "cdns.klimg.com/resized/" not in u2:continue
+            f=fname(u2)
+            if not f or f in seen or re.search(r"logo|icon|avatar|placeholder|sprite|banner|ads?",f,re.I):continue
+            org=original_url(u2)
+            if not org:continue
+            seen.add(f);photos.append({"resized":u2,"original":org,"filename":f,"caption":caption(img)});break
+    return title,intro,photos
 
-    st.markdown(f"### 🖼️ Foto Editorial — {len(article['images'])} ditemukan")
-    st.caption('Hanya aset besar dari CDN KapanLagi yang diprioritaskan; caption dicari pada teks yang berada tepat di bawah/sekitar foto.')
+@st.cache_data(ttl=3600,show_spinner=False)
+def getimg(u):
+    r=requests.get(u,headers={"User-Agent":UA,"Referer":"https://www.kapanlagi.com/"},timeout=30);r.raise_for_status()
+    return r.content
 
-    if not article['images']:
-        st.warning('Belum ada foto editorial yang cocok. Website mungkin memuat galeri melalui JavaScript atau struktur HTML berubah.')
+def font(size):
+    p="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    return ImageFont.truetype(p,size)
 
-    for i,item in enumerate(article['images']):
-        with st.container(border=True):
-            c1,c2=st.columns([1,2])
-            with c1:
-                try: st.image(item['url'], use_container_width=True)
-                except: st.warning('Preview foto gagal dimuat')
-            with c2:
-                st.markdown(f'### Foto {i+1}')
-                original=item.get('caption') or item.get('alt') or ''
-                st.text_area('Keterangan foto yang ditemukan', value=original, key=f'orig_{i}', height=90)
-                default=short_copy(original,article['title'])
-                copy=st.text_area('Copy untuk foto', value=default, key=f'copy_{i}', max_chars=120, height=80)
-                if len(copy)>70: st.warning(f'Teks cukup panjang: {len(copy)} karakter')
-                else: st.success(f'{len(copy)} karakter — masih ringkas')
+def wrap(draw,text,f,maxw):
+    out=[];cur=""
+    for w in text.split():
+        x=w if not cur else cur+" "+w
+        if draw.textbbox((0,0),x,font=f)[2]<=maxw:cur=x
+        else:
+            if cur:out.append(cur)
+            cur=w
+    if cur:out.append(cur)
+    return out[:4]
+
+def render(raw,text,template,size,tc,hc,opacity):
+    im=Image.open(io.BytesIO(raw)).convert("RGB"); W=H=1080;im.thumbnail((W,H))
+    c=Image.new("RGB",(W,H),"black");c.paste(im,((W-im.width)//2,(H-im.height)//2))
+    ov=Image.new("RGBA",(W,H),(0,0,0,0));d=ImageDraw.Draw(ov);f=font(size);lines=wrap(d,text,f,W-130)
+    lh=size+10;bh=len(lines)*lh+56
+    if template=="Bar bawah solid": y=H-bh;d.rectangle((0,y,W,H),fill=(*hc,opacity));ty=y+28
+    elif template=="Pita atas": y=45;d.rectangle((35,y,W-35,y+bh),fill=(*hc,opacity));ty=y+28
+    else:
+        y=H-bh-20
+        for i in range(bh+20):
+            a=int(opacity*i/(bh+19));d.line((0,y+i,W,y+i),fill=(*hc,a))
+        ty=y+28
+    for line in lines:
+        box=d.textbbox((0,0),line,font=f);x=(W-(box[2]-box[0]))//2
+        d.text((x,ty),line,font=f,fill=tc);ty+=lh
+    return Image.alpha_composite(c.convert("RGBA"),ov).convert("RGB")
+
+st.title("📸 Social Content Studio")
+st.caption("KapanLagi V3 — foto asli + intro + caption + visual editor")
+url=st.text_input("URL artikel KapanLagi",placeholder="https://www.kapanlagi.com/foto/...")
+if "data" not in st.session_state:st.session_state.data=None
+if st.button("🔎 Analisis Artikel",type="primary",use_container_width=True):
+    if "kapanlagi.com" not in url:st.error("V3 difokuskan untuk kapanlagi.com.")
+    else:
+        try:
+            with st.spinner("Menganalisis..."):st.session_state.data=extract(url)
+            st.success(f"Ditemukan {len(st.session_state.data[2])} foto editorial.")
+        except Exception as e:st.error(str(e))
+
+if st.session_state.data:
+    title,intro,photos=st.session_state.data
+    st.subheader(title)
+    post=st.text_area("Deskripsi Post",intro,height=120,max_chars=1000)
+    st.caption(f"{len(post)} karakter")
+    st.divider()
+    a,b,c=st.columns(3)
+    with a:template=st.selectbox("Template",["Bar bawah solid","Bar bawah gradient","Pita atas"])
+    with b:fontname=st.selectbox("Font",["Poppins","Montserrat","Oswald","Playfair Display","Anton","Bebas Neue","Inter"])
+    with c:size=st.slider("Ukuran font",36,110,68)
+    a,b,c=st.columns(3)
+    with a:tc=st.color_picker("Warna teks","#FFFFFF")
+    with b:hc=st.color_picker("Warna highlight","#000000")
+    with c:op=st.slider("Opacity highlight",0,100,75)
+    rgb=lambda x:tuple(int(x[i:i+2],16) for i in (1,3,5))
+    outputs=[]
+    st.subheader(f"Foto ({len(photos)})")
+    for i,p in enumerate(photos):
+        l,r=st.columns([1,1.1])
+        raw=None
+        with l:
+            try:raw=getimg(p["original"]);st.image(raw,use_container_width=True)
+            except Exception as e:st.warning(f"Foto asli gagal: {e}")
+        with r:
+            use=st.checkbox("Gunakan foto ini",True,key=f"use{i}")
+            cap=st.text_area(f"Caption Foto {i+1}",p["caption"][:100],max_chars=100,height=90,key=f"cap{i}")
+            st.caption(f"{len(cap)}/100 karakter")
+            if raw:
                 try:
-                    img=load_image(item['url'])
-                    card=make_card(img,copy)
-                    st.image(card,use_container_width=True,caption='Live preview 1080 × 1080')
-                    st.download_button('⬇️ Download PNG',data=card,file_name=f'social-{i+1}.png',mime='image/png',key=f'dl_{i}')
-                except Exception as e:
-                    st.info(f'Preview/download belum tersedia untuk foto ini: {e}')
+                    out=render(raw,cap,template,size,rgb(tc)+(255,),rgb(hc),int(op*2.55))
+                    st.image(out,caption="Live preview",use_container_width=True)
+                    bio=io.BytesIO();out.save(bio,"PNG");data=bio.getvalue()
+                    st.download_button(f"⬇️ Download PNG {i+1}",data,f"{i+1:02d}-{p['filename']}.png","image/png",key=f"dl{i}")
+                    if use:outputs.append((f"{i+1:02d}-{p['filename']}.png",data))
+                except Exception as e:st.error(f"Preview gagal: {e}")
+        st.divider()
+    if outputs:
+        z=io.BytesIO()
+        with zipfile.ZipFile(z,"w",zipfile.ZIP_DEFLATED) as f:
+            for n,d in outputs:f.writestr(n,d)
+            f.writestr("deskripsi-post.txt",post)
+        st.download_button("📦 Download Semua + deskripsi-post.txt",z.getvalue(),"social-content-package.zip","application/zip",type="primary",use_container_width=True)

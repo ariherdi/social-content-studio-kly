@@ -1,13 +1,15 @@
-# Social Content Studio — Streamlit POC V1
+# Social Content Studio V3
 
-URL artikel → ekstraksi foto/caption → copy pendek → preview 1080×1080 → download PNG.
+POC Streamlit khusus KapanLagi.
 
-## Deploy gratis dengan Streamlit Community Cloud
-1. Buat repository GitHub, misalnya `social-content-studio`.
-2. Upload `app.py`, `requirements.txt`, dan `README.md` ke root repository.
-3. Buka https://share.streamlit.io/ dan sign in with GitHub.
-4. Pilih repository, branch `main`, file `app.py`.
-5. Deploy.
+- Foto editorial dari CDN resized/630x
+- URL foto asli diturunkan dari filename + YYYYMMDD
+- Intro/deskripsi post
+- Caption per foto max 100 karakter
+- Pilih foto
+- 3 template visual
+- Pengaturan font/ukuran/warna/highlight
+- Preview dan download PNG
+- Download ZIP + deskripsi-post.txt
 
-## Catatan
-POC ini belum menggunakan LLM sungguhan. Fungsi `short_copy()` adalah placeholder rewrite sederhana. Website yang menggunakan JavaScript, anti-bot, atau lazy-loading tertentu mungkin tidak dapat diekstrak dengan sempurna.
+Deploy: upload app.py dan requirements.txt ke GitHub, lalu pilih app.py di Streamlit Community Cloud.
