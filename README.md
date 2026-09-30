@@ -1,32 +1,47 @@
-# Social Content Studio — KapanLagi V4
+# Social Content Studio — KapanLagi V6
 
-POC Streamlit untuk workflow social media:
-URL artikel → foto editorial → caption asli di bawah foto → rewrite AI ≤100 karakter → visual → ZIP.
+V6 fokus pada 3 hal:
 
-## 1. Streamlit Secrets
+1. Hanya mengambil foto editorial besar dari body/article content.
+2. Mendukung upload template sosial media PNG/JPG.
+3. Menampilkan preview hasil akhir setelah foto + teks + template.
 
-Di Streamlit Cloud, buka **Settings → Secrets** dan masukkan:
+## Filter foto
+
+Aplikasi tidak lagi melakukan scan seluruh halaman sebagai langkah utama.
+Foto dicari dari container yang terindikasi sebagai article/body/content/photo/gallery.
+Logo, icon, avatar, banner, ads, thumbnail, dan gambar UI disaring.
+
+Foto kecil disaring berdasarkan ukuran yang terdeteksi. Ambang default:
+- minimal lebar 600px
+- minimal tinggi 400px
+
+Jika HTML tidak memberikan ukuran, aplikasi mencoba membaca dimensi gambar.
+
+## Template
+
+Upload template PNG transparan untuk hasil seperti desain social media.
+Layer:
+1. foto
+2. backing teks + teks
+3. template PNG
+
+Template akan di-resize mengikuti ukuran template sehingga rasio output mengikuti template.
+
+## OpenAI
+
+Di Streamlit Cloud → Settings → Secrets:
 
 ```toml
 OPENAI_API_KEY = "ISI_API_KEY_ANDA"
-OPENAI_MODEL = "gpt-5.6-luna"
+OPENAI_MODEL = "gpt-5-mini"
 ```
 
-Jangan masukkan API key ke GitHub.
+Jangan commit API key ke GitHub.
 
-## 2. Jalankan lokal
+## Jalankan
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-## 3. Catatan
-
-- Fokus V4: KapanLagi.com.
-- Caption foto diprioritaskan dari teks yang tampil di bawah foto/figcaption.
-- `alt` hanya menjadi fallback terakhir.
-- Original/full-res image dibentuk dari pola CDN KapanLagi dan tanggal YYYYMMDD yang ada di filename.
-- Rewrite AI dibatasi maksimal 100 karakter.
-- Hasil rewrite tetap bisa diedit manual.
-- ZIP berisi PNG terpilih, `deskripsi-post.txt`, dan `caption-asli-dan-rewrite.txt`.

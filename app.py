@@ -3,7 +3,7 @@ import io
 import os
 import re
 import zipfile
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import requests
 import streamlit as st
@@ -29,11 +29,24 @@ FONT_MAP = {
     "Inter": "Inter-Regular.ttf",
 }
 
+CREDIT_RE = re.compile(
+    r"^(?:foto|photo|sumber|source|credit|hak cipta|copyright|"
+    r"instagram(?:\.com)?|ig(?:\s|:|$)|via(?:\s|:|$))",
+    re.I,
+)
+
+BODY_HINT_RE = re.compile(
+    r"(article[-_ ]?(body|content|detail)|content[-_ ]?(article|body|detail)|"
+    r"detail[-_ ]?(article|content|body)|photo[-_ ]?(detail|content|gallery)|"
+    r"gallery[-_ ]?(detail|content|body)|main[-_ ]?content)",
+    re.I,
+)
+
 def clean_text(s):
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 def get_html(url):
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
     r.raise_for_status()
     return r.text
 
@@ -44,7 +57,10 @@ def is_article_image(u):
     if not u:
         return False
     u = u.split("?")[0]
-    return "cdns.klimg.com/resized/" in u and bool(re.search(r"\.(jpg|jpeg|png|webp)$", u, re.I))
+    return (
+        "cdns.klimg.com/resized/" in u
+        and bool(re.search(r"\.(jpg|jpeg|png|webp)$", u, re.I))
+    )
 
 def original_url(resized_url):
     f = filename_from_url(resized_url)
@@ -52,138 +68,164 @@ def original_url(resized_url):
     if not m:
         return None
     d = m.group(1)
-    return f"https://cdns.klimg.com/kapanlagi.com/download/g/{d[:4]}/{d[4:6]}/{d[6:8]}/r/{f}"
+    return (
+        f"https://cdns.klimg.com/kapanlagi.com/download/g/"
+        f"{d[:4]}/{d[4:6]}/{d[6:8]}/r/{f}"
+    )
 
-def is_credit_text(t):
-    t = clean_text(t)
-    if not t:
-        return True
-    low = t.lower()
-    # Credits/metadata should never win over the long editorial caption.
-    if re.search(r'^(instagram|tiktok|x\.com|twitter|youtube|facebook)\\.com', low):
-        return True
-    if re.search(r'^(foto|photo|credit|sumber|source|dok|dokumentasi|via)\\s*:', low):
-        return True
-    if re.fullmatch(r'(instagram|tiktok|x|twitter|facebook|youtube)\\s*[:@].*', low):
-        return True
-    if re.search(r'instagram\\.com|tiktok\\.com|twitter\\.com|x\\.com', low) and len(t) < 120:
-        return True
-    return False
-
-def candidate_text(el):
-    if isinstance(el, NavigableString):
-        return clean_text(str(el))
-    if not getattr(el, 'name', None):
-        return ''
-    return clean_text(el.get_text(' ', strip=True))
-
-def nearby_caption(img):
-    """Extract the long editorial text displayed below the photo.
-
-    KapanLagi photo pages can place a short Instagram/photo credit immediately
-    before the actual paragraph caption. Therefore we collect several nearby
-    candidates and choose the most caption-like/long candidate instead of
-    returning the first text node.
+def visible_caption_for_img(img):
     """
-    candidates = []
+    Caption priority:
+    1. figcaption
+    2. caption-like element in same photo wrapper
+    3. visible editorial paragraph near the image
+    4. alt only as last fallback
+    Credit lines are explicitly ignored.
+    """
+    def usable(t):
+        t = clean_text(t)
+        if not t or CREDIT_RE.search(t):
+            return ""
+        # Ignore navigation/UI fragments.
+        if t.lower() in {"prev", "next", "share", "lihat selengkapnya"}:
+            return ""
+        return t
 
-    # 1) Explicit figcaption is the strongest signal.
+    # 1) figcaption
     node = img
-    for _ in range(6):
-        node = getattr(node, 'parent', None)
+    for _ in range(7):
+        node = getattr(node, "parent", None)
         if not node:
             break
-        for fc in node.find_all('figcaption', recursive=False):
-            t = candidate_text(fc)
-            if t and not is_credit_text(t):
-                candidates.append((10000 + min(len(t), 1000), t))
+        for fc in node.find_all("figcaption"):
+            t = usable(fc.get_text(" ", strip=True))
+            if t:
+                return t
 
-    # 2) Search the nearest wrappers for elements whose class/id clearly says
-    # caption/description/keterangan. Prefer the longest matching text.
-    patterns = re.compile(
-        r'(caption|photo-caption|image-caption|photo-desc|photo-description|'
-        r'keterangan|ket-foto|ket_foto|deskripsi-foto|description)', re.I
-    )
+    # 2) Caption-like elements
     node = img
-    for depth in range(7):
-        node = getattr(node, 'parent', None)
+    for _ in range(7):
+        node = getattr(node, "parent", None)
         if not node:
             break
         for el in node.find_all(True):
-            if el is img:
-                continue
-            cls = ' '.join(el.get('class', []))
-            ident = el.get('id', '')
-            if patterns.search(cls) or patterns.search(ident):
-                t = candidate_text(el)
-                if 15 <= len(t) <= 1200 and not is_credit_text(t):
-                    # Closer wrapper + longer text gets higher score.
-                    score = 7000 - depth * 100 + min(len(t), 1000)
-                    candidates.append((score, t))
+            cls = " ".join(el.get("class", []))
+            ident = el.get("id", "")
+            if re.search(r"(caption|keterangan|ket-foto|photo-desc|image-desc|photo-caption|description)", cls + " " + ident, re.I):
+                t = usable(el.get_text(" ", strip=True))
+                if t and len(t) >= 20:
+                    return t
 
-    # 3) Collect text blocks following the image inside its immediate wrapper.
-    # This is the important KapanLagi case: credit first, long paragraph next.
+    # 3) Look at nearby siblings. Prefer long editorial text, not credits.
+    candidates = []
     parent = img.parent
     if parent:
-        children = list(parent.children)
-        try:
-            idx = children.index(img)
-        except ValueError:
-            idx = -1
+        for sib in list(parent.children):
+            if sib is img:
+                continue
+            if isinstance(sib, NavigableString):
+                t = usable(str(sib))
+            else:
+                t = usable(sib.get_text(" ", strip=True))
+            if t and 20 <= len(t) <= 1200:
+                candidates.append(t)
 
-        if idx >= 0:
-            for sib in children[idx + 1:idx + 9]:
-                t = candidate_text(sib)
-                if 15 <= len(t) <= 1200 and not is_credit_text(t):
-                    # Long editorial paragraph should beat a short credit.
-                    score = 5000 + min(len(t) * 2, 1800)
-                    candidates.append((score, t))
-
-        # Also inspect the next few sibling blocks of the image wrapper.
+        # A common KapanLagi pattern is image -> paragraph -> credit.
         sib = parent.find_next_sibling()
         hops = 0
-        while sib is not None and hops < 5:
-            t = candidate_text(sib)
-            if 15 <= len(t) <= 1200 and not is_credit_text(t):
-                score = 4300 + min(len(t) * 2, 1800)
-                candidates.append((score, t))
+        while sib is not None and hops < 4:
+            t = usable(sib.get_text(" ", strip=True)) if hasattr(sib, "get_text") else ""
+            if t and 20 <= len(t) <= 1200:
+                candidates.append(t)
             sib = sib.find_next_sibling()
             hops += 1
 
-    # 4) As a broader fallback, inspect nearby ancestor children, but do not
-    # cross another image. This helps when the caption is nested deeper.
-    node = img
-    for depth in range(1, 6):
-        node = getattr(node, 'parent', None)
-        if not node:
-            break
-        seen_image = False
-        for el in node.find_all(recursive=False):
-            if el.find('img') is not None:
-                if el is img or el.find(img) is not None:
-                    continue
-                seen_image = True
-            if seen_image:
-                break
-            t = candidate_text(el)
-            if 20 <= len(t) <= 1200 and not is_credit_text(t):
-                # Only a fallback; explicit caption candidates remain stronger.
-                score = 2500 - depth * 100 + min(len(t), 1000)
-                candidates.append((score, t))
-
     if candidates:
-        # Deduplicate and choose highest-scoring candidate. If scores are close,
-        # the longer text wins, which is exactly what we want for the screenshot.
-        best = max(candidates, key=lambda x: (x[0], len(x[1])))
-        return best[1]
+        # Editorial paragraph is usually the longest useful text near the photo.
+        candidates.sort(key=lambda x: (len(x), x.count(".")), reverse=True)
+        return candidates[0]
 
-    # 5) Last fallback: alt text.
-    return clean_text(img.get('alt', ''))
+    # 4) Last fallback: alt.
+    return usable(img.get("alt", ""))
+
+def find_body_containers(soup):
+    """
+    Build a small set of likely article/gallery containers.
+    We intentionally do NOT scan the whole page first because that
+    pulls logos, recommendation cards, ads and UI images.
+    """
+    found = []
+    seen = set()
+
+    # Strong selectors first.
+    selectors = [
+        "article",
+        "main article",
+        "main",
+        "[class*='article-body']",
+        "[class*='article-content']",
+        "[class*='article-detail']",
+        "[class*='detail-content']",
+        "[class*='photo-detail']",
+        "[class*='photo-content']",
+        "[class*='gallery-content']",
+        "[class*='gallery-detail']",
+        "[id*='article']",
+        "[id*='content']",
+    ]
+
+    for sel in selectors:
+        try:
+            for el in soup.select(sel):
+                key = id(el)
+                if key not in seen:
+                    seen.add(key)
+                    found.append(el)
+        except Exception:
+            pass
+
+    # Add containers whose class/id strongly resembles body content.
+    for el in soup.find_all(True):
+        token = " ".join(el.get("class", [])) + " " + el.get("id", "")
+        if BODY_HINT_RE.search(token):
+            key = id(el)
+            if key not in seen:
+                seen.add(key)
+                found.append(el)
+
+    return found
+
+def image_size_hint(img):
+    for key in ("width", "data-width", "data-original-width"):
+        v = img.get(key)
+        if v and str(v).isdigit():
+            return int(v), None
+    for key in ("height", "data-height", "data-original-height"):
+        v = img.get(key)
+        if v and str(v).isdigit():
+            return None, int(v)
+    return None, None
+
+def download_dimensions(url):
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": UA, "Range": "bytes=0-65535"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        im = Image.open(io.BytesIO(r.content))
+        return im.width, im.height
+    except Exception:
+        return None, None
 
 def extract_page(url):
     soup = BeautifulSoup(get_html(url), "html.parser")
 
-    title = clean_text((soup.find("meta", property="og:title") or {}).get("content", "")) if soup.find("meta", property="og:title") else ""
+    title = ""
+    og = soup.find("meta", property="og:title")
+    if og:
+        title = clean_text(og.get("content", ""))
     if not title and soup.title:
         title = clean_text(soup.title.get_text())
 
@@ -192,63 +234,96 @@ def extract_page(url):
     if desc:
         intro = clean_text(desc.get("content", ""))
 
-    candidates = []
+    # Only images found in likely BODY containers.
+    containers = find_body_containers(soup)
+
+    # Score containers by editorial signals and image count.
+    scored = []
+    for c in containers:
+        imgs = [x for x in c.find_all("img") if is_article_image(
+            x.get("src") or x.get("data-src") or x.get("data-original") or ""
+        )]
+        if not imgs:
+            continue
+        text_len = len(clean_text(c.get_text(" ", strip=True)))
+        token = " ".join(c.get("class", [])) + " " + c.get("id", "")
+        strong = 1 if BODY_HINT_RE.search(token) else 0
+        # More article text + more gallery images + strong class = better.
+        score = strong * 100000 + min(text_len, 50000) + len(imgs) * 3000
+        scored.append((score, c, imgs))
+
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        # Use the best few containers only, but do not include generic page chrome.
+        chosen = [x[1] for x in scored[:3]]
+    else:
+        chosen = []
+
+    raw_imgs = []
     seen = set()
 
-    # Prefer article/gallery area.
-    scopes = []
-    for sel in ["article", "main", "[class*='article']", "[class*='gallery']", "[class*='detail']"]:
-        scopes.extend(soup.select(sel))
-
-    search_nodes = scopes if scopes else [soup]
-
-    for scope in search_nodes:
-        for img in scope.find_all("img"):
+    for container in chosen:
+        for img in container.find_all("img"):
             src = img.get("src") or img.get("data-src") or img.get("data-original") or ""
             if not is_article_image(src):
                 continue
             src = src.split("?")[0]
-            f = filename_from_url(src).lower()
-            if any(x in f for x in ["logo", "icon", "avatar", "placeholder", "sprite", "banner", "ads", "advert"]):
+            fn = filename_from_url(src).lower()
+
+            # Explicitly reject UI/branding assets.
+            if any(x in fn for x in [
+                "logo", "icon", "avatar", "placeholder", "sprite",
+                "banner", "ads", "advert", "thumbnail", "thumb"
+            ]):
                 continue
+
             if src in seen:
                 continue
             seen.add(src)
-            candidates.append({
+
+            ow, oh = image_size_hint(img)
+            raw_imgs.append({
                 "resized": src,
                 "original": original_url(src) or src,
-                "caption": nearby_caption(img),
+                "caption": visible_caption_for_img(img),
+                "html_width": ow,
+                "html_height": oh,
             })
 
-    # If scoped extraction missed images, scan whole page.
-    if not candidates:
-        for img in soup.find_all("img"):
-            src = img.get("src") or img.get("data-src") or img.get("data-original") or ""
-            if not is_article_image(src):
-                continue
-            src = src.split("?")[0]
-            f = filename_from_url(src).lower()
-            if any(x in f for x in ["logo", "icon", "avatar", "placeholder", "sprite", "banner", "ads", "advert"]):
-                continue
-            if src in seen:
-                continue
-            seen.add(src)
-            candidates.append({
-                "resized": src,
-                "original": original_url(src) or src,
-                "caption": nearby_caption(img),
-            })
+    # Remove small images. "Large" means at least 600px wide OR 400px high,
+    # and when the actual original can be inspected we require a meaningful area.
+    photos = []
+    for p in raw_imgs:
+        w, h = p["html_width"], p["html_height"]
 
-    # Limit to editorial gallery photos; dedupe by filename.
-    out, filenames = [], set()
-    for p in candidates:
+        if not w and not h:
+            w, h = download_dimensions(p["resized"])
+
+        if w and h:
+            if w < 600 or h < 400:
+                continue
+            p["width"], p["height"] = w, h
+        elif w:
+            if w < 600:
+                continue
+            p["width"], p["height"] = w, None
+        else:
+            # If dimensions cannot be read, keep only CDN article images.
+            p["width"], p["height"] = None, None
+
+        photos.append(p)
+
+    # Dedupe by filename and prefer images with an actual caption.
+    final = []
+    seen_fn = set()
+    for p in photos:
         fn = filename_from_url(p["resized"])
-        if fn in filenames:
+        if fn in seen_fn:
             continue
-        filenames.add(fn)
-        out.append(p)
+        seen_fn.add(fn)
+        final.append(p)
 
-    return title, intro, out
+    return title, intro, final
 
 def get_openai_client():
     if OpenAI is None:
@@ -266,7 +341,7 @@ def ai_rewrite(text):
     if not client:
         return text[:100]
 
-    model = st.secrets.get("OPENAI_MODEL", "gpt-5.6-luna")
+    model = st.secrets.get("OPENAI_MODEL", "gpt-5-mini")
     try:
         response = client.responses.create(
             model=model,
@@ -283,45 +358,51 @@ def ai_rewrite(text):
                 {"role": "user", "content": text},
             ],
         )
-        result = clean_text(response.output_text)
-        return result[:100]
-    except Exception as e:
-        st.warning(f"AI rewrite gagal: {e}")
+        return clean_text(response.output_text)[:100]
+    except Exception:
         return text[:100]
 
 def load_image(url):
     r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
     r.raise_for_status()
-    return Image.open(io.BytesIO(r.content)).convert("RGB")
+    return Image.open(io.BytesIO(r.content)).convert("RGBA")
 
 def font_path(name):
-    local = os.path.join("fonts", FONT_MAP.get(name, "Inter-Regular.ttf"))
-    return local if os.path.exists(local) else None
+    p = os.path.join("fonts", FONT_MAP.get(name, "Inter-Regular.ttf"))
+    return p if os.path.exists(p) else None
 
-def render_image(img, text, template, font_name, font_size, text_color, highlight_color, opacity):
-    base = img.copy().convert("RGBA")
-    W, H = base.size
-    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(overlay)
+def fit_cover(img, size):
+    W, H = size
+    iw, ih = img.size
+    scale = max(W / iw, H / ih)
+    nw, nh = int(iw * scale), int(ih * scale)
+    img = img.resize((nw, nh), Image.LANCZOS)
+    left = max(0, (nw - W) // 2)
+    top = max(0, (nh - H) // 2)
+    return img.crop((left, top, left + W, top + H))
+
+def draw_text_layer(base, text, font_name, font_size, text_color,
+                    highlight_color, highlight_opacity, position, align):
+    canvas = base.copy().convert("RGBA")
+    W, H = canvas.size
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
 
     fp = font_path(font_name)
-    if fp:
-        try:
-            font = ImageFont.truetype(fp, font_size)
-        except Exception:
-            font = ImageFont.load_default()
-    else:
+    try:
+        font = ImageFont.truetype(fp, font_size) if fp else ImageFont.load_default()
+    except Exception:
         font = ImageFont.load_default()
 
-    margin = max(24, int(W * 0.035))
+    margin = max(32, int(W * 0.06))
     max_width = W - margin * 2
 
-    words = text.split()
+    words = clean_text(text).split()
     lines, line = [], ""
     for word in words:
         test = (line + " " + word).strip()
-        box = d.textbbox((0, 0), test, font=font)
-        if box[2] - box[0] <= max_width:
+        bb = d.textbbox((0, 0), test, font=font)
+        if bb[2] - bb[0] <= max_width:
             line = test
         else:
             if line:
@@ -330,46 +411,65 @@ def render_image(img, text, template, font_name, font_size, text_color, highligh
     if line:
         lines.append(line)
 
-    bbox = d.textbbox((0, 0), "Ag", font=font)
-    line_h = bbox[3] - bbox[1] + 12
+    bb = d.textbbox((0, 0), "Ag", font=font)
+    line_h = max(1, bb[3] - bb[1]) + int(font_size * 0.16)
     total_h = line_h * len(lines)
-    pad = max(18, int(font_size * 0.45))
+    pad = max(12, int(font_size * 0.35))
 
-    if template == "bar bawah solid":
-        y0 = H - total_h - pad * 2
-        d.rectangle([0, y0, W, H], fill=highlight_color + (int(255 * opacity),))
-        y = y0 + pad
-    elif template == "bar bawah gradient":
-        grad_h = total_h + pad * 2
-        y0 = H - grad_h
-        for yy in range(y0, H):
-            a = int(210 * ((yy - y0) / max(1, grad_h)))
-            d.line([(0, yy), (W, yy)], fill=(0, 0, 0, a))
-        y = y0 + pad
+    if position == "Atas":
+        y = int(H * 0.08)
+    elif position == "Tengah":
+        y = int((H - total_h) / 2)
     else:
-        ribbon_h = total_h + pad * 2
-        y0 = pad
-        d.rounded_rectangle([margin//2, y0, W-margin//2, y0+ribbon_h], radius=18,
-                            fill=highlight_color + (int(255 * opacity),))
-        y = y0 + pad
+        y = H - total_h - int(H * 0.10)
+
+    # Subtle translucent text backing, useful even when custom template
+    # does not provide a text-safe area.
+    rect_top = max(0, y - pad)
+    rect_bottom = min(H, y + total_h + pad)
+    d.rounded_rectangle(
+        [margin // 2, rect_top, W - margin // 2, rect_bottom],
+        radius=max(8, int(font_size * 0.2)),
+        fill=highlight_color + (int(255 * highlight_opacity),),
+    )
 
     for ln in lines:
-        box = d.textbbox((0, 0), ln, font=font)
-        tw = box[2] - box[0]
-        x = (W - tw) // 2
+        bb = d.textbbox((0, 0), ln, font=font)
+        tw = bb[2] - bb[0]
+        if align == "Kiri":
+            x = margin
+        elif align == "Kanan":
+            x = W - margin - tw
+        else:
+            x = (W - tw) // 2
         d.text((x, y), ln, font=font, fill=text_color + (255,))
         y += line_h
 
-    return Image.alpha_composite(base, overlay).convert("RGB")
+    return Image.alpha_composite(canvas, layer)
 
-def color_tuple(hex_color):
-    h = hex_color.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0,2,4))
+def apply_template(photo, template_img):
+    if template_img is None:
+        return photo
+    tpl = template_img.convert("RGBA").resize(photo.size, Image.LANCZOS)
+    return Image.alpha_composite(photo.convert("RGBA"), tpl)
+
+def render_social(img, text, template_img, font_name, font_size,
+                  text_color, highlight_color, opacity, position, align):
+    # If a custom template exists, its canvas determines the final ratio.
+    if template_img is not None:
+        target_size = template_img.size
+        photo = fit_cover(img.convert("RGBA"), target_size)
+    else:
+        photo = img.convert("RGBA")
+
+    with_text = draw_text_layer(
+        photo, text, font_name, font_size, text_color,
+        highlight_color, opacity, position, align
+    )
+    return apply_template(with_text, template_img).convert("RGB")
 
 st.title("Social Content Studio — KapanLagi")
-st.caption("POC: URL artikel → foto editorial → caption asli → rewrite AI → visual siap posting")
-
-url = st.text_input("URL artikel KapanLagi.com", placeholder="https://www.kapanlagi.com/foto/...")
+st.caption("URL artikel → foto body content ukuran besar → caption asli → rewrite AI → template → preview → export")
 
 if "photos" not in st.session_state:
     st.session_state.photos = []
@@ -380,6 +480,11 @@ if "title" not in st.session_state:
 if "intro" not in st.session_state:
     st.session_state.intro = ""
 
+url = st.text_input(
+    "URL artikel KapanLagi.com",
+    placeholder="https://www.kapanlagi.com/foto/..."
+)
+
 if st.button("🔎 Analisis Artikel", type="primary") and url:
     try:
         title, intro, photos = extract_page(url)
@@ -387,86 +492,117 @@ if st.button("🔎 Analisis Artikel", type="primary") and url:
         st.session_state.intro = intro
         st.session_state.photos = photos
         st.session_state.rewrites = {}
-        st.success(f"Ditemukan {len(photos)} foto editorial.")
+        st.success(f"Ditemukan {len(photos)} foto besar dari body content.")
     except Exception as e:
         st.error(f"Gagal membaca artikel: {e}")
 
 if st.session_state.photos:
-    st.subheader("Deskripsi Post Utama")
-    main_desc = st.text_area("Teks yang akan menjadi deskripsi post", value=st.session_state.intro, height=110)
-    st.download_button("⬇️ Download deskripsi-post.txt", main_desc, file_name="deskripsi-post.txt")
+    st.subheader("1. Deskripsi Post Utama")
+    main_desc = st.text_area(
+        "Deskripsi post",
+        value=st.session_state.intro,
+        height=110,
+    )
+    st.download_button(
+        "⬇️ Download deskripsi-post.txt",
+        main_desc,
+        file_name="deskripsi-post.txt",
+    )
 
     st.divider()
-    st.subheader("Pengaturan Visual")
+    st.subheader("2. Template Sosial Media")
+
+    template_file = st.file_uploader(
+        "Upload template PNG/JPG",
+        type=["png", "jpg", "jpeg"],
+        help="Paling disarankan PNG transparan. Elemen template akan berada di lapisan paling atas foto.",
+    )
+
+    template_img = None
+    if template_file is not None:
+        try:
+            template_img = Image.open(template_file).convert("RGBA")
+            st.success(f"Template aktif: {template_img.width} × {template_img.height}px")
+            if template_img.getextrema()[-1] != (255, 255):
+                st.caption("Template memiliki transparansi dan akan menjadi overlay di atas foto + teks.")
+        except Exception as e:
+            st.error(f"Template tidak dapat dibaca: {e}")
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        template = st.selectbox("Template", ["bar bawah solid", "bar bawah gradient", "pita atas"])
         font_name = st.selectbox("Font", list(FONT_MAP.keys()))
+        position = st.selectbox("Posisi teks", ["Bawah", "Tengah", "Atas"], index=0)
     with c2:
         font_size = st.slider("Ukuran font", 24, 120, 54)
-        opacity = st.slider("Opacity highlight", 0.10, 1.00, 0.85)
+        align = st.selectbox("Alignment", ["Kiri", "Tengah", "Kanan"], index=0)
     with c3:
         text_color_hex = st.color_picker("Warna teks", "#FFFFFF")
-        highlight_color_hex = st.color_picker("Warna highlight", "#000000")
+        highlight_color_hex = st.color_picker("Warna backing teks", "#000000")
+        opacity = st.slider("Opacity backing teks", 0.0, 1.0, 0.70)
 
-    text_color = color_tuple(text_color_hex)
-    highlight_color = color_tuple(highlight_color_hex)
+    text_color = tuple(int(text_color_hex.lstrip("#")[i:i+2], 16) for i in (0,2,4))
+    highlight_color = tuple(int(highlight_color_hex.lstrip("#")[i:i+2], 16) for i in (0,2,4))
 
     st.divider()
-    st.subheader("Foto & Caption")
+    st.subheader("3. Foto, Caption & Preview")
 
     for i, p in enumerate(st.session_state.photos):
         if f"selected_{i}" not in st.session_state:
             st.session_state[f"selected_{i}"] = True
 
         with st.container(border=True):
-            col_img, col_edit = st.columns([1.15, 1])
+            left, right = st.columns([0.85, 1.15])
 
-            with col_edit:
+            with left:
                 selected = st.checkbox(f"Pilih foto {i+1}", key=f"selected_{i}")
 
-                st.markdown("**Caption asli — teks di bawah foto**")
+                st.markdown("**Caption asli — teks editorial di bawah foto**")
                 st.text_area(
                     f"Caption asli {i+1}",
-                    value=p["caption"],
-                    height=90,
+                    value=p.get("caption", ""),
+                    height=120,
                     disabled=True,
                     key=f"orig_{i}",
                     label_visibility="collapsed",
                 )
 
                 if i not in st.session_state.rewrites:
-                    st.session_state.rewrites[i] = ai_rewrite(p["caption"])
+                    st.session_state.rewrites[i] = ai_rewrite(p.get("caption", ""))
 
                 rewritten = st.text_area(
-                    f"Caption rewrite AI {i+1}",
+                    f"Rewrite AI {i+1}",
                     value=st.session_state.rewrites[i],
                     max_chars=100,
                     height=90,
                     key=f"rewrite_{i}",
-                    help="Teks ini yang akan ditempel ke foto saat diekspor.",
                 )
                 st.session_state.rewrites[i] = rewritten
-                st.caption(f"{len(rewritten)}/100 karakter — teks yang ditempel ke foto")
+                st.caption(f"{len(rewritten)}/100 karakter")
 
                 if st.button("✨ Rewrite ulang", key=f"rerun_{i}"):
-                    st.session_state.rewrites[i] = ai_rewrite(p["caption"])
+                    st.session_state.rewrites[i] = ai_rewrite(p.get("caption", ""))
                     st.rerun()
 
-            with col_img:
+                if p.get("width") and p.get("height"):
+                    st.caption(f"Ukuran sumber terdeteksi: {p['width']} × {p['height']} px")
+
+            with right:
                 try:
-                    preview = load_image(p["original"])
-                    rendered = render_image(
-                        preview,
+                    source_img = load_image(p["original"])
+                    rendered = render_social(
+                        source_img,
                         st.session_state.rewrites[i],
-                        template,
+                        template_img,
                         font_name,
                         font_size,
                         text_color,
                         highlight_color,
                         opacity,
+                        position,
+                        align,
                     )
+
+                    st.markdown("**Preview hasil akhir**")
                     st.image(rendered, use_container_width=True)
 
                     bio = io.BytesIO()
@@ -479,51 +615,51 @@ if st.session_state.photos:
                         key=f"dl_{i}",
                     )
                 except Exception as e:
-                    st.error(f"Gagal memuat/render foto: {e}")
+                    st.error(f"Gagal membuat preview: {e}")
+
+    st.divider()
 
     if st.button("📦 Download Semua", type="primary"):
         selected_items = []
+
         for i, p in enumerate(st.session_state.photos):
-            if st.session_state.get(f"selected_{i}", False):
-                try:
-                    img = load_image(p["original"])
-                    out = render_image(
-                        img,
-                        st.session_state.rewrites.get(i, "")[:100],
-                        template,
-                        font_name,
-                        font_size,
-                        text_color,
-                        highlight_color,
-                        opacity,
-                    )
-                    b = io.BytesIO()
-                    out.save(b, format="PNG")
-                    selected_items.append((i, b.getvalue(), p))
-                except Exception:
-                    pass
+            if not st.session_state.get(f"selected_{i}", False):
+                continue
+            try:
+                img = load_image(p["original"])
+                rendered = render_social(
+                    img,
+                    st.session_state.rewrites.get(i, "")[:100],
+                    template_img,
+                    font_name,
+                    font_size,
+                    text_color,
+                    highlight_color,
+                    opacity,
+                    position,
+                    align,
+                )
+                b = io.BytesIO()
+                rendered.save(b, format="PNG")
+                selected_items.append((i, b.getvalue(), p))
+            except Exception:
+                pass
 
         z = io.BytesIO()
         with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zz:
             for i, data, p in selected_items:
                 zz.writestr(f"social-{i+1:02d}.png", data)
 
-            lines = [
-                f"JUDUL: {st.session_state.title}",
-                "",
-                "DESKRIPSI POST:",
-                main_desc,
-                "",
-                "CAPTION FOTO:",
-            ]
-            for i, data, p in selected_items:
+            zz.writestr("deskripsi-post.txt", main_desc)
+
+            lines = [f"JUDUL: {st.session_state.title}", "", "CAPTION FOTO:"]
+            for i, _, p in selected_items:
                 lines += [
                     "",
                     f"FOTO {i+1}",
-                    f"Caption asli: {p['caption']}",
+                    f"Caption asli: {p.get('caption', '')}",
                     f"Rewrite AI: {st.session_state.rewrites.get(i, '')[:100]}",
                 ]
-            zz.writestr("deskripsi-post.txt", main_desc)
             zz.writestr("caption-asli-dan-rewrite.txt", "\n".join(lines))
 
         st.download_button(
