@@ -1,8 +1,9 @@
+import hashlib
 import io
 import os
 import re
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 import streamlit as st
@@ -175,7 +176,7 @@ def extract_article_image_urls_raw(page_html):
             for key, val in img.attrs.items():
                 if not isinstance(val, str):
                     continue
-                m = re.search(r"https?://[^\\\"'<>\\s]+\\.(?:jpg|jpeg|png|webp)(?:\\?[^\\\"'<>\\s]*)?", val, re.I)
+                m = re.search(r"https?://[^\"'<>\s]+\.(?:jpg|jpeg|png|webp)(?:\?[^\"'<>\s]*)?", val, re.I)
                 if m and is_article_image(m.group(0)):
                     u = normalize_candidate_url(m.group(0))
                     break
@@ -310,56 +311,52 @@ def extract_main_intro(soup):
     return ""
 
 
-def extract_caption_blocks_raw(page_html):
-    """Extract KapanLagi editorial captions using the page's own markers.
+MARKER_RE = re.compile(
+    r"<!--\s*STARTOFPAGEDESCRIPTIONBOTTOM\s*-->([\s\S]*?)"
+    r"<!--\s*ENDOFPAGEDESCRIPTIONBOTTOM\s*-->",
+    re.I,
+)
 
-    This intentionally does NOT try to associate a caption with a filename.
-    KapanLagi puts the gallery photo and its editorial paragraph in the same
-    page block, in the same order. We therefore pair images and caption blocks
-    by position. This avoids failures when lazy-loaded image URLs are rewritten
-    or normalized before BeautifulSoup sees them.
-    """
+
+def _caption_text_from_fragment(fragment_html):
+    frag = BeautifulSoup(fragment_html or "", "html.parser")
+    for bad in frag.find_all(["figure", "figcaption", "img", "script", "style"]):
+        bad.decompose()
+    ps = frag.select(".pages-paragraph p") or frag.find_all("p")
+    if ps:
+        return clean_text(" ".join(x.get_text(" ", strip=True) for x in ps))
+    return clean_text(frag.get_text(" ", strip=True))
+
+
+def marker_blocks_with_pos(page_html):
+    """[(char_position, caption_text)] for every STARTOFPAGEDESCRIPTIONBOTTOM block."""
+    out = []
+    for m in MARKER_RE.finditer(page_html or ""):
+        text = _caption_text_from_fragment(m.group(1))
+        if len(text) >= 40 and not CREDIT_RE.match(text):
+            out.append((m.start(), text))
+    return out
+
+
+def extract_caption_blocks_raw(page_html):
+    """Editorial caption texts of one response, in document order."""
     if not page_html:
         return []
+    blocks = marker_blocks_with_pos(page_html)
+    if blocks:
+        return [t for _, t in blocks]
 
-    captions = []
-
-    # Primary source: explicit KapanLagi description markers.
-    marker_re = re.compile(
-        r"<!--\s*STARTOFPAGEDESCRIPTIONBOTTOM\s*-->([\s\S]*?)"
-        r"<!--\s*ENDOFPAGEDESCRIPTIONBOTTOM\s*-->",
-        re.I,
-    )
-    for m in marker_re.finditer(page_html):
-        frag = BeautifulSoup(m.group(1), "html.parser")
-        # Prefer the actual paragraph text, never image alt/credit text.
-        ps = frag.select(".pages-paragraph p")
-        if ps:
-            text = clean_text(" ".join(x.get_text(" ", strip=True) for x in ps))
-        else:
-            node = frag.select_one(".pages-paragraph")
-            text = clean_text(node.get_text(" ", strip=True)) if node else ""
-        if len(text) >= 40 and not CREDIT_RE.match(text):
-            captions.append(text)
-
-    if captions:
-        return captions
-
-    # Secondary source for KapanLagi variants without explicit markers:
-    # collect pages-paragraph blocks that occur after gallery figures.
+    # Secondary: .pages-paragraph inside gallery items (never the page-intro).
     soup = BeautifulSoup(page_html, "html.parser")
     out = []
     for para in soup.select("div.pages-paragraph, p.pages-paragraph"):
         text = clean_text(para.get_text(" ", strip=True))
         if len(text) < 40 or CREDIT_RE.match(text):
             continue
-        # Do not take the article intro. A gallery caption has a preceding
-        # pages-img figure in the same page item.
-        parent = para.find_parent(".pages-item[data-type='content-pages']")
-        if parent is None:
-            parent = para.find_parent(class_=lambda c: c and "pages-item" in c)
-        if parent is not None:
-            out.append(text)
+        parent = para.find_parent(class_=lambda c: c and "pages-item" in c)
+        if parent is None or parent.get("data-type") == "page-intro":
+            continue
+        out.append(text)
     return out
 
 
@@ -406,111 +403,122 @@ def extract_photo_editorial_text_from_page_html(page_html):
     return captions[0] if captions else ""
 
 
-def parse_gallery_html(html, source_url, photos, seen):
-    """Parse gallery images and captions, then MERGE results across requests.
+def page_number_from_url(u):
+    m = re.search(r"[?&]page=(\d+)", u or "")
+    return int(m.group(1)) if m else None
 
-    Important V25 fix:
-    The article response can contain all five gallery images but only the
-    first editorial paragraph. The individual ?page=N responses contain the
-    remaining captions. Earlier versions marked those image URLs as `seen`
-    and therefore discarded the later captions. V25 keeps the photo identity
-    but allows a later response to fill an empty caption.
-    """
-    soup = BeautifulSoup(html or "", "html.parser")
-    pages = soup.select(".pages-item[data-type='content-pages']")
-    diag = {
-        "url": source_url,
-        "content_pages": len(pages),
-        "pages_img": len(soup.select("figure.pages-img")),
-        "imgs": len(soup.find_all("img")),
-        "article_images": 0,
-        "editorial_captions": 0,
-        "caption_blocks_raw": len(extract_caption_blocks_raw(html)),
-        "pairing": "positional+merge",
+
+def analyse_response(page_html):
+    """Evidence found in ONE HTTP response."""
+    texts = list(dict.fromkeys(extract_caption_blocks_raw(page_html)))
+    return {
+        "texts": texts,
+        "img_urls": extract_article_image_urls_raw(page_html),
+        "marker_raw": (page_html or "").upper().count("STARTOFPAGEDESCRIPTIONBOTTOM"),
+        "marker_blocks": len(marker_blocks_with_pos(page_html)),
     }
 
-    raw_captions = extract_caption_blocks_raw(html)
-    raw_article_urls = extract_article_image_urls_raw(html)
 
-    # Existing photos are indexed by original URL so later page responses can
-    # enrich the same photo rather than creating a duplicate or skipping it.
-    existing = {p.get("original"): p for p in photos if p.get("original")}
+def register_images(photos, img_urls, source_url):
+    known = {p["original"] for p in photos}
+    for u in img_urls:
+        orig, fn = original_url(u), filename_from_url(u)
+        if not orig or not fn or orig in known:
+            continue
+        known.add(orig)
+        photos.append({
+            "resized": u, "original": orig, "filename": fn,
+            "caption": "", "caption_source": "NOT FOUND",
+            "source_page": source_url, "log": [], "detail_urls": [],
+        })
 
-    def upsert(resized, idx, page_obj=None):
-        filename = filename_from_url(resized)
-        original = original_url(resized)
-        if not filename or not original:
-            return
 
-        caption = ""
-        if idx < len(raw_captions):
-            caption = raw_captions[idx]
-        if not caption and page_obj is not None:
-            page_caps = extract_caption_blocks_raw(str(page_obj))
-            if page_caps:
-                caption = page_caps[0]
-        if not caption:
-            caption = extract_caption_by_filename(html, filename)
-        if not caption and page_obj is not None:
-            figure = page_obj.select_one("figure.pages-img") if hasattr(page_obj, "select_one") else None
-            if figure:
-                caption = extract_photo_editorial_text(figure)
+def set_caption(photos, idx, text, source):
+    """Fill ONLY an empty caption; never reuse one caption for two photos."""
+    p = photos[idx]
+    text = clean_text(text)
+    if not text:
+        return False
+    if p.get("caption"):
+        if p["caption"] != text:
+            p["log"].append(f"konflik: {source} memberi teks lain; teks lama dipertahankan")
+        return False
+    for j, q in enumerate(photos):
+        if j != idx and q.get("caption") == text:
+            p["log"].append(f"ditolak dari {source}: teks identik dengan foto {j+1}")
+            return False
+    p["caption"], p["caption_source"] = text, source
+    p["log"].append(f"terisi dari {source}")
+    return True
 
-        if original in existing:
-            # Do not overwrite a good caption with blank text. If this request
-            # finally supplies the editorial paragraph, fill it in.
-            item = existing[original]
-            if caption and not item.get("caption"):
-                item["caption"] = caption
-                item["caption_source"] = "KapanLagi marker/order"
-                diag["editorial_captions"] += 1
-            return
 
-        item = {
-            "resized": resized,
-            "original": original,
-            "caption": caption,
-            "filename": filename,
-            "source_page": source_url,
-            "caption_source": "KapanLagi marker/order" if caption else "NOT FOUND",
-        }
-        photos.append(item)
-        existing[original] = item
-        seen.add(original)
-        diag["article_images"] += 1
-        if caption:
-            diag["editorial_captions"] += 1
+def apply_response(photos, ev, page_no, is_base=False):
+    """Map the caption blocks of one response onto gallery photos.
 
-    # 1. Raw URL path works even when the live response has no gallery classes.
-    for idx, resized in enumerate(raw_article_urls):
-        upsert(resized, idx)
+    Blocks in a response are consecutive gallery items starting at the photo
+    the response is about: base -> photo 1; ?page=N -> photo N (or the single
+    image the response contains). This replaces V25's per-response image index,
+    which paired the ONLY caption of a ?page=N response with image #0 of that
+    response (already filled), so photos 2-5 stayed empty.
+    """
+    texts = ev["texts"]
+    if not texts:
+        return "tidak ada blok caption"
+    fnames = list(dict.fromkeys(filename_from_url(u) for u in ev["img_urls"]))
+    idx_by_fn = {p["filename"]: i for i, p in enumerate(photos)}
 
-    # 2. If the response has explicit content-page wrappers, process them too.
-    # This also allows the exact page block to supply a caption that the raw
-    # positional pass could not see.
-    if pages:
-        for idx, page in enumerate(pages):
-            img = page.select_one("figure.pages-img img") or page.find("img")
-            if not img:
-                continue
-            resized = extract_img_url(img)
-            if not is_article_image(resized):
-                continue
-            upsert(resized, idx, page)
+    if is_base:
+        start, how = 0, "respons dasar"
+    elif len(texts) > 1 and len(texts) >= len(photos):
+        start, how = 0, "galeri penuh"
+    elif len(fnames) == 1 and fnames[0] in idx_by_fn:
+        start, how = idx_by_fn[fnames[0]], "satu gambar di respons"
+    elif page_no:
+        start, how = page_no - 1, f"nomor halaman {page_no}"
+    else:
+        return "foto target tidak dapat ditentukan"
 
-    # 3. For responses with no recognized gallery image at all, keep the old
-    # raw scanner as a last resort.
-    if not raw_article_urls and not pages:
-        for idx, resized in enumerate(extract_gallery_images_raw(html)):
-            upsert(resized, idx)
+    filled = []
+    for j, t in enumerate(texts):
+        k = start + j
+        if k >= len(photos):
+            break
+        if set_caption(photos, k, t, f"KapanLagi marker ({how})"):
+            filled.append(k + 1)
+    return f"mulai foto {start+1} [{how}]; terisi foto: {filled or '-'}"
 
-    # Keep diagnostic count useful: number of article images present in this
-    # response, not only newly-created records.
-    diag["article_images"] = len(raw_article_urls) if raw_article_urls else len(pages)
-    return diag, soup
+
+def find_detail_urls(raw_pages, filename, base_url):
+    """Find individual photo-detail URLs (.../<id><filename-stem>.html) in ANY raw response."""
+    stem = os.path.splitext(filename)[0]
+    pat = re.compile(
+        r"""(?:https?:)?(?://|/)[^\s"'<>\\]*?""" + re.escape(stem) + r"""[^\s"'<>\\]*?\.html""",
+        re.I,
+    )
+    found = []
+    for html in raw_pages.values():
+        for m in pat.finditer((html or "").replace("\\/", "/")):
+            u = urljoin(base_url, m.group(0))
+            if "kapanlagi.com" in urlparse(u).netloc and u.split("?")[0] != base_url.split("?")[0] and u not in found:
+                found.append(u)
+    return found
+
+
+def caption_from_detail(detail_html, filename):
+    blocks = marker_blocks_with_pos(detail_html)
+    if blocks:
+        if len(blocks) == 1:
+            return blocks[0][1]
+        fpos = [m.start() for m in re.finditer(re.escape(filename), detail_html)]
+        for pos, t in blocks:
+            if any(fp < pos for fp in fpos):
+                return t
+        return blocks[0][1]
+    texts = extract_caption_blocks_raw(detail_html)
+    return texts[0] if texts else ""
+
 
 def extract_page(url):
-    # Fetch initial document.
     html, first_diag = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
 
@@ -521,49 +529,120 @@ def extract_page(url):
     if not title and soup.title:
         title = clean_text(soup.title.get_text())
 
-    # KapanLagi photo articles store the real article introduction inside
-    # the page-intro block. Meta description is not the editorial intro.
     intro = extract_main_intro(soup)
     if not intro:
         desc = soup.find("meta", attrs={"name": "description"})
         if desc:
             intro = clean_text(desc.get("content", ""))
 
-    photos = []
-    seen = set()
-    diagnostics = []
+    photos, rows, raw_pages = [], [], {url: html}
 
-    # 1. Parse whatever gallery is already present in the initial response.
-    d, _ = parse_gallery_html(html, url, photos, seen)
-    d.update({k: first_diag[k] for k in ("status", "bytes", "content_type", "final_url")})
-    diagnostics.append(d)
+    def row(u, meta, ev, note, page_no):
+        fns = [filename_from_url(x) for x in ev["img_urls"]]
+        return {
+            "url": u, "page": page_no,
+            "status": meta.get("status"), "bytes": meta.get("bytes"),
+            "md5": hashlib.md5(raw_pages[u].encode("utf-8", "ignore")).hexdigest()[:10],
+            "marker_raw": ev["marker_raw"], "marker_blocks": ev["marker_blocks"],
+            "distinct_captions": len(ev["texts"]),
+            "caption_starts": " | ".join(t[:28] for t in ev["texts"]),
+            "article_imgs": len(fns),
+            "filenames": ", ".join(dict.fromkeys(re.sub(r"^.*?-(?:19|20)\d{6}-", "", f) for f in fns)),
+            "decision": note,
+        }
 
-    # 2. Crucial fallback: crawl the gallery page URLs.
-    page_urls = page_urls_from_soup(soup, url)
-    for page_url in page_urls:
-        if page_url == url:
-            continue
-        if len(photos) >= 30:
+    # 1. Base response = photo 1
+    ev = analyse_response(html)
+    register_images(photos, ev["img_urls"], url)
+    rows.append(row(url, first_diag, ev, apply_response(photos, ev, 1, is_base=True), None))
+
+    # 2. ?page=N responses
+    pagemap = {}
+    for el in soup.select("[data-pageurl]"):
+        u = (el.get("data-pageurl") or "").strip()
+        n = page_number_from_url(u)
+        if n and u and "kapanlagi.com" in u:
+            pagemap.setdefault(n, u)
+    base_clean = urlparse(url)._replace(query="", fragment="").geturl()
+
+    n = 1
+    while n <= min(30, max(len(photos), 5)):
+        if photos and all(p["caption"] for p in photos) and n > len(photos):
             break
+        purl = pagemap.get(n) or f"{base_clean}?page={n}"
         try:
-            page_html, pd = fetch_html(page_url)
-            pdg, _ = parse_gallery_html(page_html, page_url, photos, seen)
-            pdg.update({k: pd[k] for k in ("status", "bytes", "content_type", "final_url")})
-            diagnostics.append(pdg)
+            ph, meta = fetch_html(purl)
         except Exception as e:
-            diagnostics.append({"url": page_url, "error": str(e)})
-
-    # Remove duplicate diagnostics for repeated URLs while preserving order.
-    unique_diag = []
-    seen_diag = set()
-    for d in diagnostics:
-        key = d.get("url")
-        if key in seen_diag:
+            rows.append({"url": purl, "page": n, "decision": f"ERROR: {e}"})
+            n += 1
             continue
-        seen_diag.add(key)
-        unique_diag.append(d)
+        raw_pages[purl] = ph
+        pev = analyse_response(ph)
+        register_images(photos, pev["img_urls"], purl)
+        rows.append(row(purl, meta, pev, apply_response(photos, pev, n), n))
+        n += 1
 
-    return title, intro, photos, unique_diag
+    # 3. Fallback: individual photo detail page for photos still empty
+    for i, p in enumerate(photos):
+        if p["caption"]:
+            continue
+        p["detail_urls"] = find_detail_urls(raw_pages, p["filename"], url)
+        if not p["detail_urls"]:
+            p["log"].append("tidak ada link halaman detail di respons mana pun")
+        for du in p["detail_urls"][:2]:
+            try:
+                dh, dmeta = fetch_html(du)
+                raw_pages[du] = dh
+                cap = caption_from_detail(dh, p["filename"])
+                p["log"].append(f"detail {du}: status {dmeta['status']}, {dmeta['bytes']} B, caption {'ada' if cap else 'kosong'}")
+                if cap and set_caption(photos, i, cap, "Halaman detail foto"):
+                    break
+            except Exception as e:
+                p["log"].append(f"detail {du}: ERROR {e}")
+
+    # 4. Last resort, clearly labelled weak: first paragraph after the <img> in the DOM
+    for i, p in enumerate(photos):
+        if p["caption"]:
+            continue
+        for h in raw_pages.values():
+            cap = extract_caption_by_filename(h, p["filename"])
+            if cap and cap not in intro and set_caption(photos, i, cap, "Heuristik DOM (LEMAH - periksa manual)"):
+                break
+
+    for p in photos:
+        p["caption_found"] = bool(p["caption"])
+    return title, intro, photos, rows, raw_pages
+
+
+def search_raw(raw_pages, needle):
+    """Where (which response, inside <script>?) does a text snippet occur?"""
+    out, nl = [], needle.lower().strip()
+    if not nl:
+        return out
+    for u, h in raw_pages.items():
+        hl, start, c = h.lower(), 0, 0
+        while True:
+            i = hl.find(nl, start)
+            if i < 0:
+                break
+            c += 1
+            if c <= 2:
+                in_script = hl.rfind("<script", 0, i) > hl.rfind("</script>", 0, i)
+                out.append({"response": u, "pos": i, "in_script": in_script,
+                            "context": clean_text(h[max(0, i-120):i+len(needle)+120])})
+            start = i + len(nl)
+        if c == 0:
+            out.append({"response": u, "pos": None, "in_script": None, "context": "tidak ditemukan"})
+    return out
+
+
+def raw_pages_zip(raw_pages):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, (u, h) in enumerate(raw_pages.items()):
+            z.writestr(f"{i:02d}.html", f"<!-- {u} -->\n{h}")
+    return b.getvalue()
+
 
 def get_openai_client():
     if OpenAI is None:
@@ -721,6 +800,8 @@ if "intro" not in st.session_state:
     st.session_state.intro = ""
 if "diagnostics" not in st.session_state:
     st.session_state.diagnostics = []
+if "raw_pages" not in st.session_state:
+    st.session_state.raw_pages = {}
 
 url = st.text_input(
     "URL artikel KapanLagi.com",
@@ -729,20 +810,50 @@ url = st.text_input(
 
 if st.button("🔎 Analisis Artikel", type="primary") and url:
     try:
-        title, intro, photos, diagnostics = extract_page(url)
+        title, intro, photos, diagnostics, raw_pages = extract_page(url)
         st.session_state.diagnostics = diagnostics
+        st.session_state.raw_pages = raw_pages
         st.session_state.title = title
         st.session_state.intro = intro
         st.session_state.photos = photos
         st.session_state.rewrites = {}
-        st.success(f"Ditemukan {len(photos)} foto besar dari body content.")
-        with st.expander("🔧 Diagnosis Fetch & Parser", expanded=False):
-            st.dataframe(st.session_state.diagnostics, use_container_width=True)
-            st.caption("V23 memasangkan caption berdasarkan urutan blok gallery KapanLagi, bukan berdasarkan filename.")
+        for k in [k for k in st.session_state.keys() if k.startswith(("selected_", "orig_", "rewrite_"))]:
+            del st.session_state[k]
+        n_cap = sum(1 for p in photos if p.get("caption"))
+        st.success(f"Ditemukan {len(photos)} foto besar; caption editorial ditemukan untuk {n_cap} foto.")
         if not photos:
             st.warning("Gallery tidak ditemukan pada respons server.")
     except Exception as e:
         st.error(f"Gagal membaca artikel: {e}")
+
+if st.session_state.photos:
+    with st.expander("🔧 Diagnosis V26: respons per halaman & caption per foto", expanded=any(not p.get("caption") for p in st.session_state.photos)):
+        st.markdown("**A. Respons yang diterima server (base + ?page=N)**")
+        st.dataframe(st.session_state.diagnostics, use_container_width=True)
+        st.markdown("**B. Status caption per foto**")
+        st.dataframe(
+            [{
+                "foto": i + 1,
+                "filename": p["filename"],
+                "caption": "ya" if p.get("caption") else "TIDAK",
+                "panjang": len(p.get("caption", "")),
+                "sumber": p.get("caption_source", ""),
+                "detail_urls": " ; ".join(p.get("detail_urls", [])),
+                "log": " || ".join(p.get("log", [])),
+            } for i, p in enumerate(st.session_state.photos)],
+            use_container_width=True,
+        )
+        st.markdown("**C. Cari potongan teks di respons mentah** (mis. 30 karakter pertama caption yang seharusnya)")
+        needle = st.text_input("Potongan teks", key="dbg_needle", placeholder="Selain di photo wall")
+        if needle:
+            st.dataframe(search_raw(st.session_state.get("raw_pages", {}), needle), use_container_width=True)
+        if st.session_state.get("raw_pages"):
+            st.download_button(
+                "⬇️ Download respons mentah (ZIP)",
+                raw_pages_zip(st.session_state.raw_pages),
+                file_name="respons-mentah-kapanlagi.zip",
+                mime="application/zip",
+            )
 
 if st.session_state.photos:
     st.subheader("1. Deskripsi Post Utama")
@@ -808,6 +919,8 @@ if st.session_state.photos:
                 source_label = p.get("caption_source", "")
                 if source_label == "NOT FOUND":
                     st.warning("Caption editorial belum ditemukan.")
+                elif source_label.startswith("Heuristik"):
+                    st.warning(f"Sumber caption: {source_label}")
                 elif source_label:
                     st.caption(f"Sumber caption: {source_label}")
                 st.text_area(
