@@ -185,20 +185,32 @@ def parse_gallery_html(html, source_url, photos, seen):
     for page in pages:
         if getattr(page, "name", None) == "figure":
             figure = page
-            img = figure.find("img")
-            caption = ""
-            parent = figure.parent
-            if parent:
-                para = parent.select_one(".pages-paragraph")
-                if para:
-                    caption = clean_text(para.get_text(" ", strip=True))
         else:
             figure = page.select_one("figure.pages-img") or page
-            img = figure.find("img") if figure else None
-            caption = ""
-            para = page.select_one(".pages-paragraph")
-            if para:
-                caption = clean_text(para.get_text(" ", strip=True))
+
+        img = figure.find("img") if figure else None
+        caption = ""
+
+        # IMPORTANT: KapanLagi's real editorial text is NOT the image alt/caption.
+        # It is the .pages-paragraph that appears AFTER the figure, inside the
+        # same .box-body. We deliberately find that paragraph relative to the
+        # figure so ads/other markup inside the figure cannot break extraction.
+        if figure:
+            box_body = figure.find_parent(class_="box-body")
+            if box_body:
+                para = figure.find_next("div", class_="pages-paragraph")
+                if para and para.find_parent(class_="box-body") is box_body:
+                    caption = clean_text(para.get_text(" ", strip=True))
+
+                # Extra fallback: inspect all paragraphs in this exact box and
+                # take the first one that occurs after the figure in the DOM.
+                if not caption:
+                    for candidate in box_body.select(".pages-paragraph"):
+                        if candidate.find_parent(class_="box-body") is box_body:
+                            previous_figures = candidate.find_all_previous("figure", class_="pages-img")
+                            if previous_figures and previous_figures[0] is figure:
+                                caption = clean_text(candidate.get_text(" ", strip=True))
+                                break
 
         if not img:
             continue
@@ -643,7 +655,7 @@ if st.session_state.photos:
                     f"Caption asli: {p.get('caption', '')}",
                     f"Rewrite AI: {st.session_state.rewrites.get(i, '')[:100]}",
                 ]
-            zz.writestr("caption-asli-dan-rewrite.txt", "\n".join(lines))
+            zz.writestr("teks-asli-dan-rewrite.txt", "\n".join(lines))
 
         st.download_button(
             "⬇️ Download ZIP",
