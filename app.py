@@ -1,9 +1,8 @@
-
 import io
 import os
 import re
 import zipfile
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 
 import requests
 import streamlit as st
@@ -189,336 +188,203 @@ def extract_main_intro(soup):
     return ""
 
 
-def _is_credit_text(text):
-    text = clean_text(text)
-    if not text:
-        return True
-    if CREDIT_RE.search(text):
-        return True
-    low = text.lower()
-    return any(x in low for x in (
-        "hak cipta", "copyright", "instagram.com", "twitter.com",
-        "facebook.com", "tiktok.com", "sumber:", "source:", "credit:"
-    ))
+def extract_caption_blocks_raw(page_html):
+    """Extract KapanLagi editorial captions using the page's own markers.
+
+    This intentionally does NOT try to associate a caption with a filename.
+    KapanLagi puts the gallery photo and its editorial paragraph in the same
+    page block, in the same order. We therefore pair images and caption blocks
+    by position. This avoids failures when lazy-loaded image URLs are rewritten
+    or normalized before BeautifulSoup sees them.
+    """
+    if not page_html:
+        return []
+
+    captions = []
+
+    # Primary source: explicit KapanLagi description markers.
+    marker_re = re.compile(
+        r"<!--\s*STARTOFPAGEDESCRIPTIONBOTTOM\s*-->([\s\S]*?)"
+        r"<!--\s*ENDOFPAGEDESCRIPTIONBOTTOM\s*-->",
+        re.I,
+    )
+    for m in marker_re.finditer(page_html):
+        frag = BeautifulSoup(m.group(1), "html.parser")
+        # Prefer the actual paragraph text, never image alt/credit text.
+        ps = frag.select(".pages-paragraph p")
+        if ps:
+            text = clean_text(" ".join(x.get_text(" ", strip=True) for x in ps))
+        else:
+            node = frag.select_one(".pages-paragraph")
+            text = clean_text(node.get_text(" ", strip=True)) if node else ""
+        if len(text) >= 40 and not CREDIT_RE.match(text):
+            captions.append(text)
+
+    if captions:
+        return captions
+
+    # Secondary source for KapanLagi variants without explicit markers:
+    # collect pages-paragraph blocks that occur after gallery figures.
+    soup = BeautifulSoup(page_html, "html.parser")
+    out = []
+    for para in soup.select("div.pages-paragraph, p.pages-paragraph"):
+        text = clean_text(para.get_text(" ", strip=True))
+        if len(text) < 40 or CREDIT_RE.match(text):
+            continue
+        # Do not take the article intro. A gallery caption has a preceding
+        # pages-img figure in the same page item.
+        parent = para.find_parent(".pages-item[data-type='content-pages']")
+        if parent is None:
+            parent = para.find_parent(class_=lambda c: c and "pages-item" in c)
+        if parent is not None:
+            out.append(text)
+    return out
 
 
-def _caption_candidate(node):
-    """Return a plausible editorial paragraph from a DOM node."""
-    name = getattr(node, "name", None)
-    if name not in ("p", "div", "section", "article", "span"):
-        return None
-    text = clean_text(node.get_text(" ", strip=True))
-    if len(text) < 40 or _is_credit_text(text):
-        return None
+def extract_gallery_images_raw(page_html):
+    """Return article image URLs in DOM order from a gallery response."""
+    soup = BeautifulSoup(page_html or "", "html.parser")
+    urls = []
+    seen = set()
 
-    # Reject page-wide containers. Editorial captions are normally concise.
-    if len(text) > 900:
-        return None
+    pages = soup.select(".pages-item[data-type='content-pages']")
+    if pages:
+        for page in pages:
+            img = page.select_one("figure.pages-img img") or page.find("img")
+            if not img:
+                continue
+            u = extract_img_url(img)
+            if is_article_image(u) and u not in seen:
+                seen.add(u)
+                urls.append(u)
+        return urls
 
-    classes = node.get("class") or []
-    score = 0
-    if "pages-paragraph" in classes:
-        score += 100000
-    if name == "p":
-        score += 50000
-    if any(x in " ".join(classes).lower() for x in ("caption", "description", "paragraph")):
-        score += 10000
-    # Prefer text that looks like normal editorial prose rather than UI.
-    if text.endswith((".", "!", "?")):
-        score += 1000
-    score += min(len(text), 500)
-    return score, text
+    for img in soup.select("figure.pages-img img"):
+        u = extract_img_url(img)
+        if is_article_image(u) and u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls
 
 
 def extract_photo_editorial_text(figure):
-    """Extract the editorial text belonging to one KapanLagi gallery photo.
-
-    This intentionally does NOT depend on box-body, pages-item, figcaption,
-    alt text, or any particular wrapper. It follows the actual document flow
-    after the image and stops at the next gallery image.
-    """
+    """Extract the editorial paragraph directly below one gallery photo."""
     if not figure:
         return ""
 
-    candidates = []
-    for node in figure.next_elements:
-        name = getattr(node, "name", None)
+    # Exact marker is the strongest signal and survives wrapper changes.
+    marker = figure.find_next(string=lambda x: isinstance(x, Comment) and
+                              "STARTOFPAGEDESCRIPTIONBOTTOM" in x)
+    if marker:
+        parent = marker.parent
+        node = parent.find_next(class_=lambda c: c and "pages-paragraph" in c)
+        if node:
+            text = clean_text(node.get_text(" ", strip=True))
+            if len(text) >= 40 and not CREDIT_RE.match(text):
+                return text
 
-        # Stop when the next gallery photo starts.
-        if name == "figure" and node is not figure:
-            classes = node.get("class") or []
-            if "pages-img" in classes or node.find("img") is not None:
-                break
-
-        cand = _caption_candidate(node)
-        if cand:
-            candidates.append(cand)
-            # The first exact pages-paragraph is the desired answer.
-            if "pages-paragraph" in (node.get("class") or []):
-                return cand[1]
-
-        # Don't wander through an entire page if a huge wrapper is encountered.
-        if len(candidates) >= 20:
+    # DOM fallback: first pages-paragraph after this figure before another figure.
+    for node in figure.find_all_next():
+        if getattr(node, "name", None) == "figure" and node is not figure:
             break
-
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
+        classes = node.get("class") or [] if getattr(node, "name", None) else []
+        if "pages-paragraph" in classes:
+            text = clean_text(node.get_text(" ", strip=True))
+            if len(text) >= 40 and not CREDIT_RE.match(text):
+                return text
     return ""
 
 
-def extract_photo_detail_url(figure, page, base_url, filename):
-    """Find the dedicated KapanLagi photo-detail URL for this image.
-
-    KapanLagi can expose each gallery image as its own /foto/.../*.html page.
-    Those detail pages contain the editorial paragraph even when the gallery
-    wrapper returned to a crawler does not.
-    """
-    candidates = []
-
-    def add_href(href):
-        if not href:
-            return
-        u = urljoin(base_url, href.strip())
-        low = u.lower()
-        if 'kapanlagi.com/foto/' not in low:
-            return
-        if filename and filename.lower() not in low:
-            # Still allow /foto/... detail URLs, but score exact filename higher.
-            candidates.append((1, u))
-        else:
-            candidates.append((10, u))
-
-    if figure:
-        for a in figure.find_all_previous('a', href=True, limit=8):
-            add_href(a.get('href'))
-        for a in figure.find_all_next('a', href=True, limit=8):
-            add_href(a.get('href'))
-        parent = figure.find_parent('a', href=True)
-        if parent:
-            add_href(parent.get('href'))
-
-    if page:
-        for a in page.select('a[href]'):
-            add_href(a.get('href'))
-
-    if not candidates:
-        return ''
-    # Prefer URLs that contain the exact image filename.
-    candidates.sort(key=lambda x: (x[0], -len(x[1])), reverse=True)
-    return candidates[0][1]
-
-
-def extract_caption_from_detail_html(html, filename):
-    """Extract the single photo caption from a dedicated photo-detail page."""
-    if not html:
-        return ''
-    soup = BeautifulSoup(html, 'html.parser')
-
-    # First anchor on the exact image, then follow document flow until a
-    # meaningful editorial paragraph is encountered. There is only one gallery
-    # image on a dedicated photo page, so no gallery-boundary ambiguity exists.
-    target = None
-    if filename:
-        for img in soup.find_all('img'):
-            srcs = [img.get(k, '') for k in ('src', 'data-src', 'data-original', 'data-lazy-src')]
-            if any(filename in (x or '') for x in srcs):
-                target = img
-                break
-    if target:
-        for node in target.next_elements:
-            cand = _caption_candidate(node)
-            if cand:
-                return cand[1]
-
-    # Raw filename fallback.
-    if filename:
-        raw = extract_caption_from_raw_html(html, filename)
-        if raw:
-            return raw
-
-    return ''
-
-
-def extract_caption_from_raw_html(html, filename):
-    """Raw HTML fallback keyed to the actual photo filename.
-
-    Useful when the DOM wrapper differs between KapanLagi responses.
-    """
-    if not html or not filename:
-        return ""
-
-    # Find the actual image filename, then inspect only the document flow
-    # until the next gallery image filename.
-    pos = html.find(filename)
-    if pos < 0:
-        return ""
-
-    tail = html[pos:]
-    # A gallery image normally has another *_YYYYMMDD_* filename later.
-    nxt = re.search(r'[A-Za-z0-9._-]+-(?:19|20)\d{6}-[A-Za-z0-9._-]+\.(?:jpg|jpeg|png|webp)', tail[len(filename):], re.I)
-    if nxt:
-        tail = tail[:len(filename) + nxt.start()]
-    tail = tail[:20000]
-
-    frag = BeautifulSoup(tail, "html.parser")
-    candidates = []
-    for node in frag.find_all(["p", "div", "section", "article", "span"]):
-        cand = _caption_candidate(node)
-        if cand:
-            candidates.append(cand)
-            if "pages-paragraph" in (node.get("class") or []):
-                return cand[1]
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
-    return ""
-
-
-def extract_photo_editorial_text_from_page_html(page_html, filename=""):
-    """Fallback using the complete document, never only the gallery wrapper."""
-    if not page_html:
-        return ""
-    soup = BeautifulSoup(page_html, "html.parser")
-    if filename:
-        raw = extract_caption_from_raw_html(page_html, filename)
-        if raw:
-            return raw
-    figure = soup.select_one("figure.pages-img")
-    if figure:
-        return extract_photo_editorial_text(figure)
-    return ""
-
-def caption_debug_info(html, figure, filename):
-    """Return small diagnostics showing what the app actually received."""
-    info = {"filename_found": False, "after_filename_text": "", "nearby_text_nodes": []}
-    if not html or not filename:
-        return info
-    pos = html.find(filename)
-    info["filename_found"] = pos >= 0
-    if pos >= 0:
-        snippet = html[pos + len(filename): pos + len(filename) + 5000]
-        # Show text only, so the UI is readable.
-        frag = BeautifulSoup(snippet, "html.parser")
-        info["after_filename_text"] = clean_text(frag.get_text(" ", strip=True))[:2000]
-    if figure:
-        count = 0
-        for node in figure.next_elements:
-            if getattr(node, "name", None) == "figure" and node is not figure:
-                break
-            cand = _caption_candidate(node)
-            if cand:
-                info["nearby_text_nodes"].append(cand[1][:500])
-                count += 1
-                if count >= 8:
-                    break
-    return info
+def extract_photo_editorial_text_from_page_html(page_html):
+    captions = extract_caption_blocks_raw(page_html)
+    return captions[0] if captions else ""
 
 
 def parse_gallery_html(html, source_url, photos, seen):
+    """Parse gallery images and pair captions by KapanLagi page order.
+
+    V23 deliberately uses a different association strategy from previous
+    versions: image filename matching is NOT required for caption extraction.
+    Each gallery page item contains one image followed by one marked editorial
+    description, so we pair them positionally.
+    """
     soup = BeautifulSoup(html, "html.parser")
+    pages = soup.select(".pages-item[data-type='content-pages']")
     diag = {
         "url": source_url,
-        "content_pages": len(soup.select(".pages-item[data-type='content-pages']")),
+        "content_pages": len(pages),
         "pages_img": len(soup.select("figure.pages-img")),
         "imgs": len(soup.find_all("img")),
         "article_images": 0,
         "editorial_captions": 0,
+        "caption_blocks_raw": len(extract_caption_blocks_raw(html)),
+        "pairing": "positional",
     }
 
-    # Exact KapanLagi photo-gallery structure.
-    pages = soup.select(".pages-item[data-type='content-pages']")
-    if not pages:
-        pages = soup.select("figure.pages-img")
+    raw_captions = extract_caption_blocks_raw(html)
 
-    for page in pages:
-        if getattr(page, "name", None) == "figure":
-            figure = page
-        else:
-            figure = page.select_one("figure.pages-img") or page
+    # Best path: process each content-page independently. This guarantees
+    # caption #1 belongs to photo #1 even if the page contains ad markup.
+    if pages:
+        for idx, page in enumerate(pages):
+            img = page.select_one("figure.pages-img img")
+            if not img:
+                continue
+            resized = extract_img_url(img)
+            if not is_article_image(resized):
+                continue
 
-        img = figure.find("img") if figure else None
-        if not img:
-            continue
+            filename = filename_from_url(resized)
+            original = original_url(resized)
+            if not filename or not original or original in seen:
+                continue
 
-        resized = extract_img_url(img)
-        if not is_article_image(resized):
-            continue
+            caption = ""
+            # First try the exact page item, then the raw page-level caption list.
+            page_caps = extract_caption_blocks_raw(str(page))
+            if page_caps:
+                caption = page_caps[0]
+            elif idx < len(raw_captions):
+                caption = raw_captions[idx]
+            else:
+                figure = page.select_one("figure.pages-img")
+                caption = extract_photo_editorial_text(figure)
 
+            seen.add(original)
+            diag["article_images"] += 1
+            if caption:
+                diag["editorial_captions"] += 1
+
+            photos.append({
+                "resized": resized,
+                "original": original,
+                "caption": caption,
+                "filename": filename,
+                "source_page": source_url,
+                "caption_source": "KapanLagi marker/order" if caption else "NOT FOUND",
+            })
+        return diag, soup
+
+    # Fallback for responses without content-page wrappers.
+    imgs = extract_gallery_images_raw(html)
+    for idx, resized in enumerate(imgs):
         filename = filename_from_url(resized)
         original = original_url(resized)
         if not filename or not original or original in seen:
             continue
-
-        diag["article_images"] += 1
+        caption = raw_captions[idx] if idx < len(raw_captions) else ""
         seen.add(original)
-
-        # Caption asli MUST be the long editorial paragraph below the photo.
-        # Never use img[alt] or figcaption as a fallback.
-        caption = extract_photo_editorial_text(figure)
-        caption_source = "pages-paragraph / document flow" if caption else ""
-
-        if not caption:
-            # The description may sit outside the `.pages-item` wrapper,
-            # so parse the whole document rather than `str(page)`.
-            caption = extract_photo_editorial_text_from_page_html(html, filename)
-            if caption:
-                caption_source = "document flow fallback"
-
-        # Final source-specific fallback: fetch the dedicated photo page.
-        # This is important because KapanLagi exposes gallery photos as
-        # individual /foto/.../*.html pages in some responses.
-        detail_url = extract_photo_detail_url(figure, page, source_url, filename)
-        if detail_url:
-            try:
-                detail_html, detail_diag = fetch_html(detail_url)
-                diag.setdefault("detail_fetches", 0)
-                diag["detail_fetches"] += 1
-                if not caption:
-                    caption = extract_caption_from_detail_html(detail_html, filename)
-                    if caption:
-                        caption_source = "dedicated photo page"
-                if caption:
-                    diag.setdefault("detail_captions", 0)
-                    diag["detail_captions"] += 1
-            except Exception as e:
-                diag.setdefault("detail_errors", []).append(str(e))
-
+        diag["article_images"] += 1
         if caption:
             diag["editorial_captions"] += 1
-
-        debug = caption_debug_info(html, figure, filename) if not caption else {}
-
         photos.append({
             "resized": resized,
             "original": original,
             "caption": caption,
             "filename": filename,
             "source_page": source_url,
-            "caption_source": caption_source,
-            "caption_debug": debug,
-            "detail_url": detail_url,
+            "caption_source": "KapanLagi marker/order" if caption else "NOT FOUND",
         })
-
-    # Diagnostic fallback for unusual responses without content-pages wrappers.
-    if not pages:
-        for img in soup.find_all("img"):
-            resized = extract_img_url(img)
-            if not is_article_image(resized):
-                continue
-            filename = filename_from_url(resized)
-            original = original_url(resized)
-            if not filename or not original or original in seen:
-                continue
-            seen.add(original)
-            photos.append({
-                "resized": resized,
-                "original": original,
-                "caption": "",
-                "filename": filename,
-                "source_page": source_url,
-                "caption_source": "",
-            })
 
     return diag, soup
 
@@ -749,11 +615,11 @@ if st.button("🔎 Analisis Artikel", type="primary") and url:
         st.session_state.photos = photos
         st.session_state.rewrites = {}
         st.success(f"Ditemukan {len(photos)} foto besar dari body content.")
+        with st.expander("🔧 Diagnosis Fetch & Parser", expanded=False):
+            st.dataframe(st.session_state.diagnostics, use_container_width=True)
+            st.caption("V23 memasangkan caption berdasarkan urutan blok gallery KapanLagi, bukan berdasarkan filename.")
         if not photos:
-            st.warning("Gallery tidak muncul pada HTML awal, jadi app sudah mencoba URL halaman foto ?page=1, ?page=2, dan seterusnya. Lihat Diagnosis Fetch di bawah untuk mengetahui respons server.")
-            with st.expander("🔧 Diagnosis Fetch & Parser", expanded=True):
-                st.dataframe(st.session_state.diagnostics, use_container_width=True)
-                st.caption("content_pages = jumlah .pages-item[data-type='content-pages']; pages_img = jumlah figure.pages-img; article_images = CDN resized yang berhasil dikenali.")
+            st.warning("Gallery tidak ditemukan pada respons server.")
     except Exception as e:
         st.error(f"Gagal membaca artikel: {e}")
 
@@ -818,6 +684,11 @@ if st.session_state.photos:
                 selected = st.checkbox(f"Pilih foto {i+1}", key=f"selected_{i}")
 
                 st.markdown("**Caption asli — teks editorial di bawah foto**")
+                source_label = p.get("caption_source", "")
+                if source_label == "NOT FOUND":
+                    st.warning("Caption editorial belum ditemukan.")
+                elif source_label:
+                    st.caption(f"Sumber caption: {source_label}")
                 st.text_area(
                     f"Caption asli {i+1}",
                     value=p.get("caption", ""),
@@ -826,15 +697,6 @@ if st.session_state.photos:
                     key=f"orig_{i}",
                     label_visibility="collapsed",
                 )
-
-                if not p.get("caption"):
-                    st.warning("Caption editorial belum ditemukan dari HTML yang diterima aplikasi.")
-                    dbg = p.get("caption_debug", {})
-                    with st.expander("🔧 Debug HTML caption", expanded=False):
-                        st.write("Filename ditemukan:", dbg.get("filename_found", False))
-                        st.text_area("Teks setelah filename", dbg.get("after_filename_text", ""), height=180, disabled=True, key=f"dbg_after_{i}")
-                        st.write("Kandidat teks setelah foto:")
-                        st.json(dbg.get("nearby_text_nodes", []))
 
                 if i not in st.session_state.rewrites:
                     st.session_state.rewrites[i] = ai_rewrite(p.get("caption", ""))

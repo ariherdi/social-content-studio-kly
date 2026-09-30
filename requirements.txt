@@ -1,5 +1,5 @@
-streamlit>=1.50
-requests>=2.32
-beautifulsoup4>=4.13
-Pillow>=11.0
-openai>=1.100
+streamlit>=1.45,<2
+requests>=2.31
+beautifulsoup4>=4.12
+Pillow>=10.0
+openai>=1.40
