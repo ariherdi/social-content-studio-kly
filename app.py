@@ -644,42 +644,86 @@ def raw_pages_zip(raw_pages):
     return b.getvalue()
 
 
+def _secret(name, default=""):
+    try:
+        v = st.secrets.get(name, "")
+    except Exception:
+        v = ""
+    return v or os.environ.get(name, "") or default
+
+
 def get_openai_client():
+    key = _secret("OPENAI_API_KEY")
     if OpenAI is None:
-        return None
-    key = st.secrets.get("OPENAI_API_KEY", "")
+        return None, "Library openai tidak terpasang (cek requirements.txt)."
     if not key:
-        return None
-    return OpenAI(api_key=key)
+        return None, "OPENAI_API_KEY tidak ditemukan di Secrets Streamlit."
+    try:
+        return OpenAI(api_key=key), ""
+    except Exception as e:
+        return None, f"Gagal membuat client OpenAI: {e}"
+
+
+AI_SYSTEM_PROMPT = (
+    "Kamu adalah editor sosial media berita Indonesia. "
+    "Rewrite caption foto menjadi satu kalimat/frasa singkat, jelas, menarik, dan faktual. "
+    "Jangan menambah informasi baru. Maksimal 100 karakter. "
+    "Jangan memakai tanda kutip. Jangan menyebut kata caption."
+)
+
+
+def call_openai(client, model, text):
+    """Try the Responses API, then Chat Completions. Raises with a readable reason."""
+    errors = []
+    if hasattr(client, "responses"):
+        try:
+            r = client.responses.create(
+                model=model,
+                input=[{"role": "system", "content": AI_SYSTEM_PROMPT},
+                       {"role": "user", "content": text}],
+            )
+            out = clean_text(getattr(r, "output_text", ""))
+            if out:
+                return out
+            errors.append("Responses API mengembalikan teks kosong")
+        except Exception as e:
+            errors.append(f"Responses API: {type(e).__name__}: {e}")
+    else:
+        errors.append("library openai terlalu lama (tidak punya client.responses)")
+    try:
+        r = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": AI_SYSTEM_PROMPT},
+                      {"role": "user", "content": text}],
+        )
+        out = clean_text(r.choices[0].message.content or "")
+        if out:
+            return out
+        errors.append("Chat Completions mengembalikan teks kosong")
+    except Exception as e:
+        errors.append(f"Chat Completions: {type(e).__name__}: {e}")
+    raise RuntimeError(" | ".join(errors))
+
 
 def ai_rewrite(text):
+    """Rewrite <= 100 chars. On failure returns a plain cut of the caption and
+    records the reason in st.session_state.ai_last_error (shown in the UI)."""
     text = clean_text(text)
     if not text:
         return ""
-    client = get_openai_client()
+    client, err = get_openai_client()
     if not client:
+        st.session_state.ai_last_error = err
+        return text[:100]
+    try:
+        out = call_openai(client, _secret("OPENAI_MODEL", "gpt-5-mini"), text)
+        st.session_state.ai_last_error = ""
+        out = out.strip().strip('"\u201c\u201d')
+        return out[:100]
+    except Exception as e:
+        st.session_state.ai_last_error = str(e)
         return text[:100]
 
-    model = st.secrets.get("OPENAI_MODEL", "gpt-5-mini")
-    try:
-        response = client.responses.create(
-            model=model,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Kamu adalah editor sosial media berita Indonesia. "
-                        "Rewrite caption foto menjadi satu kalimat/frasa singkat, jelas, menarik, dan faktual. "
-                        "Jangan menambah informasi baru. Maksimal 100 karakter. "
-                        "Jangan memakai tanda kutip. Jangan menyebut kata caption."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
-        )
-        return clean_text(response.output_text)[:100]
-    except Exception:
-        return text[:100]
 
 def load_image(url):
     r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
@@ -800,6 +844,8 @@ if "intro" not in st.session_state:
     st.session_state.intro = ""
 if "diagnostics" not in st.session_state:
     st.session_state.diagnostics = []
+if "ai_last_error" not in st.session_state:
+    st.session_state.ai_last_error = ""
 if "raw_pages" not in st.session_state:
     st.session_state.raw_pages = {}
 
@@ -904,6 +950,23 @@ if st.session_state.photos:
 
     st.divider()
     st.subheader("3. Foto, Caption & Preview")
+
+    _client, _cerr = get_openai_client()
+    _model = _secret("OPENAI_MODEL", "gpt-5-mini")
+    if _client is None:
+        st.error(f"AI belum terhubung: {_cerr} Rewrite saat ini hanya memotong caption 100 karakter.")
+    else:
+        st.info(f"API key terbaca. Model: {_model}")
+    if st.session_state.get("ai_last_error"):
+        st.warning(f"Rewrite AI gagal, dipakai potongan caption. Penyebab: {st.session_state.ai_last_error}")
+    if st.button("🧪 Tes koneksi AI"):
+        if _client is None:
+            st.error(_cerr)
+        else:
+            try:
+                st.success("Berhasil: " + call_openai(_client, _model, "YoonA hadir di Milan Fashion Week mengenakan setelan jas cokelat."))
+            except Exception as e:
+                st.error(str(e))
 
     for i, p in enumerate(st.session_state.photos):
         if f"selected_{i}" not in st.session_state:
