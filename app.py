@@ -407,14 +407,16 @@ def extract_photo_editorial_text_from_page_html(page_html):
 
 
 def parse_gallery_html(html, source_url, photos, seen):
-    """Parse gallery images and pair captions by KapanLagi page order.
+    """Parse gallery images and captions, then MERGE results across requests.
 
-    V23 deliberately uses a different association strategy from previous
-    versions: image filename matching is NOT required for caption extraction.
-    Each gallery page item contains one image followed by one marked editorial
-    description, so we pair them positionally.
+    Important V25 fix:
+    The article response can contain all five gallery images but only the
+    first editorial paragraph. The individual ?page=N responses contain the
+    remaining captions. Earlier versions marked those image URLs as `seen`
+    and therefore discarded the later captions. V25 keeps the photo identity
+    but allows a later response to fill an empty caption.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html or "", "html.parser")
     pages = soup.select(".pages-item[data-type='content-pages']")
     diag = {
         "url": source_url,
@@ -424,104 +426,87 @@ def parse_gallery_html(html, source_url, photos, seen):
         "article_images": 0,
         "editorial_captions": 0,
         "caption_blocks_raw": len(extract_caption_blocks_raw(html)),
-        "raw_dated_images": len(extract_article_image_urls_raw(html)),
-        "pairing": "positional",
+        "pairing": "positional+merge",
     }
 
     raw_captions = extract_caption_blocks_raw(html)
-
-    # New V24 path: identify dated KapanLagi filenames first. This works even
-    # when the live response has no pages-item, figure, or marker comments.
     raw_article_urls = extract_article_image_urls_raw(html)
-    if raw_article_urls:
-        for idx, resized in enumerate(raw_article_urls):
-            filename = filename_from_url(resized)
-            original = original_url(resized)
-            if not filename or not original or original in seen:
-                continue
-            caption = ""
-            if idx < len(raw_captions):
-                caption = raw_captions[idx]
-            if not caption:
-                caption = extract_caption_by_filename(html, filename)
-            seen.add(original)
-            diag["article_images"] += 1
-            if caption:
-                diag["editorial_captions"] += 1
-            photos.append({
-                "resized": resized,
-                "original": original,
-                "caption": caption,
-                "filename": filename,
-                "source_page": source_url,
-                "caption_source": "KapanLagi marker/order" if caption else "NOT FOUND",
-            })
-        if photos:
-            return diag, soup
 
-    # Best path: process each content-page independently. This guarantees
-    # caption #1 belongs to photo #1 even if the page contains ad markup.
-    if pages:
-        for idx, page in enumerate(pages):
-            img = page.select_one("figure.pages-img img")
-            if not img:
-                continue
-            resized = extract_img_url(img)
-            if not is_article_image(resized):
-                continue
+    # Existing photos are indexed by original URL so later page responses can
+    # enrich the same photo rather than creating a duplicate or skipping it.
+    existing = {p.get("original"): p for p in photos if p.get("original")}
 
-            filename = filename_from_url(resized)
-            original = original_url(resized)
-            if not filename or not original or original in seen:
-                continue
-
-            caption = ""
-            # First try the exact page item, then the raw page-level caption list.
-            page_caps = extract_caption_blocks_raw(str(page))
-            if page_caps:
-                caption = page_caps[0]
-            elif idx < len(raw_captions):
-                caption = raw_captions[idx]
-            else:
-                figure = page.select_one("figure.pages-img")
-                caption = extract_photo_editorial_text(figure)
-
-            seen.add(original)
-            diag["article_images"] += 1
-            if caption:
-                diag["editorial_captions"] += 1
-
-            photos.append({
-                "resized": resized,
-                "original": original,
-                "caption": caption,
-                "filename": filename,
-                "source_page": source_url,
-                "caption_source": "KapanLagi marker/order" if caption else "NOT FOUND",
-            })
-        return diag, soup
-
-    # Fallback for responses without content-page wrappers.
-    imgs = extract_gallery_images_raw(html)
-    for idx, resized in enumerate(imgs):
+    def upsert(resized, idx, page_obj=None):
         filename = filename_from_url(resized)
         original = original_url(resized)
-        if not filename or not original or original in seen:
-            continue
-        caption = raw_captions[idx] if idx < len(raw_captions) else ""
-        seen.add(original)
-        diag["article_images"] += 1
-        if caption:
-            diag["editorial_captions"] += 1
-        photos.append({
+        if not filename or not original:
+            return
+
+        caption = ""
+        if idx < len(raw_captions):
+            caption = raw_captions[idx]
+        if not caption and page_obj is not None:
+            page_caps = extract_caption_blocks_raw(str(page_obj))
+            if page_caps:
+                caption = page_caps[0]
+        if not caption:
+            caption = extract_caption_by_filename(html, filename)
+        if not caption and page_obj is not None:
+            figure = page_obj.select_one("figure.pages-img") if hasattr(page_obj, "select_one") else None
+            if figure:
+                caption = extract_photo_editorial_text(figure)
+
+        if original in existing:
+            # Do not overwrite a good caption with blank text. If this request
+            # finally supplies the editorial paragraph, fill it in.
+            item = existing[original]
+            if caption and not item.get("caption"):
+                item["caption"] = caption
+                item["caption_source"] = "KapanLagi marker/order"
+                diag["editorial_captions"] += 1
+            return
+
+        item = {
             "resized": resized,
             "original": original,
             "caption": caption,
             "filename": filename,
             "source_page": source_url,
             "caption_source": "KapanLagi marker/order" if caption else "NOT FOUND",
-        })
+        }
+        photos.append(item)
+        existing[original] = item
+        seen.add(original)
+        diag["article_images"] += 1
+        if caption:
+            diag["editorial_captions"] += 1
 
+    # 1. Raw URL path works even when the live response has no gallery classes.
+    for idx, resized in enumerate(raw_article_urls):
+        upsert(resized, idx)
+
+    # 2. If the response has explicit content-page wrappers, process them too.
+    # This also allows the exact page block to supply a caption that the raw
+    # positional pass could not see.
+    if pages:
+        for idx, page in enumerate(pages):
+            img = page.select_one("figure.pages-img img") or page.find("img")
+            if not img:
+                continue
+            resized = extract_img_url(img)
+            if not is_article_image(resized):
+                continue
+            upsert(resized, idx, page)
+
+    # 3. For responses with no recognized gallery image at all, keep the old
+    # raw scanner as a last resort.
+    if not raw_article_urls and not pages:
+        for idx, resized in enumerate(extract_gallery_images_raw(html)):
+            upsert(resized, idx)
+
+    # Keep diagnostic count useful: number of article images present in this
+    # response, not only newly-created records.
+    diag["article_images"] = len(raw_article_urls) if raw_article_urls else len(pages)
     return diag, soup
 
 def extract_page(url):
