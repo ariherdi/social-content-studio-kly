@@ -54,60 +54,131 @@ def original_url(resized_url):
     d = m.group(1)
     return f"https://cdns.klimg.com/kapanlagi.com/download/g/{d[:4]}/{d[4:6]}/{d[6:8]}/r/{f}"
 
+def is_credit_text(t):
+    t = clean_text(t)
+    if not t:
+        return True
+    low = t.lower()
+    # Credits/metadata should never win over the long editorial caption.
+    if re.search(r'^(instagram|tiktok|x\.com|twitter|youtube|facebook)\\.com', low):
+        return True
+    if re.search(r'^(foto|photo|credit|sumber|source|dok|dokumentasi|via)\\s*:', low):
+        return True
+    if re.fullmatch(r'(instagram|tiktok|x|twitter|facebook|youtube)\\s*[:@].*', low):
+        return True
+    if re.search(r'instagram\\.com|tiktok\\.com|twitter\\.com|x\\.com', low) and len(t) < 120:
+        return True
+    return False
+
+def candidate_text(el):
+    if isinstance(el, NavigableString):
+        return clean_text(str(el))
+    if not getattr(el, 'name', None):
+        return ''
+    return clean_text(el.get_text(' ', strip=True))
+
 def nearby_caption(img):
-    # 1) Primary: visible figcaption associated with the photo.
-    node = img
-    for _ in range(5):
-        node = getattr(node, "parent", None)
-        if not node:
-            break
-        fc = node.find("figcaption")
-        if fc:
-            t = clean_text(fc.get_text(" ", strip=True))
-            if t:
-                return t
+    """Extract the long editorial text displayed below the photo.
 
-    # 2) Text immediately after the image / image wrapper.
-    parent = img.parent
-    if parent:
-        # Direct following siblings
-        for sib in list(parent.children):
-            if sib is img:
-                continue
-            if isinstance(sib, NavigableString):
-                t = clean_text(str(sib))
-            else:
-                # stop after finding a plausible element
-                tag = getattr(sib, "name", "")
-                t = clean_text(sib.get_text(" ", strip=True)) if tag else ""
-            if t and len(t) >= 3 and len(t) <= 500:
-                return t
+    KapanLagi photo pages can place a short Instagram/photo credit immediately
+    before the actual paragraph caption. Therefore we collect several nearby
+    candidates and choose the most caption-like/long candidate instead of
+    returning the first text node.
+    """
+    candidates = []
 
-        # Look at immediate next sibling of the wrapper
-        sib = parent.find_next_sibling()
-        if sib:
-            t = clean_text(sib.get_text(" ", strip=True))
-            if t and len(t) <= 500:
-                return t
-
-    # 3) Caption-like classes/attributes in the nearest wrappers.
-    patterns = re.compile(r"(caption|photo-caption|image-caption|keterangan|ket-foto|description)", re.I)
+    # 1) Explicit figcaption is the strongest signal.
     node = img
     for _ in range(6):
-        node = getattr(node, "parent", None)
+        node = getattr(node, 'parent', None)
+        if not node:
+            break
+        for fc in node.find_all('figcaption', recursive=False):
+            t = candidate_text(fc)
+            if t and not is_credit_text(t):
+                candidates.append((10000 + min(len(t), 1000), t))
+
+    # 2) Search the nearest wrappers for elements whose class/id clearly says
+    # caption/description/keterangan. Prefer the longest matching text.
+    patterns = re.compile(
+        r'(caption|photo-caption|image-caption|photo-desc|photo-description|'
+        r'keterangan|ket-foto|ket_foto|deskripsi-foto|description)', re.I
+    )
+    node = img
+    for depth in range(7):
+        node = getattr(node, 'parent', None)
         if not node:
             break
         for el in node.find_all(True):
-            cls = " ".join(el.get("class", []))
-            ident = el.get("id", "")
+            if el is img:
+                continue
+            cls = ' '.join(el.get('class', []))
+            ident = el.get('id', '')
             if patterns.search(cls) or patterns.search(ident):
-                t = clean_text(el.get_text(" ", strip=True))
-                if t and t != clean_text(img.get("alt", "")) and len(t) <= 700:
-                    return t
+                t = candidate_text(el)
+                if 15 <= len(t) <= 1200 and not is_credit_text(t):
+                    # Closer wrapper + longer text gets higher score.
+                    score = 7000 - depth * 100 + min(len(t), 1000)
+                    candidates.append((score, t))
 
-    # 4) Last fallback: alt text.
-    alt = clean_text(img.get("alt", ""))
-    return alt
+    # 3) Collect text blocks following the image inside its immediate wrapper.
+    # This is the important KapanLagi case: credit first, long paragraph next.
+    parent = img.parent
+    if parent:
+        children = list(parent.children)
+        try:
+            idx = children.index(img)
+        except ValueError:
+            idx = -1
+
+        if idx >= 0:
+            for sib in children[idx + 1:idx + 9]:
+                t = candidate_text(sib)
+                if 15 <= len(t) <= 1200 and not is_credit_text(t):
+                    # Long editorial paragraph should beat a short credit.
+                    score = 5000 + min(len(t) * 2, 1800)
+                    candidates.append((score, t))
+
+        # Also inspect the next few sibling blocks of the image wrapper.
+        sib = parent.find_next_sibling()
+        hops = 0
+        while sib is not None and hops < 5:
+            t = candidate_text(sib)
+            if 15 <= len(t) <= 1200 and not is_credit_text(t):
+                score = 4300 + min(len(t) * 2, 1800)
+                candidates.append((score, t))
+            sib = sib.find_next_sibling()
+            hops += 1
+
+    # 4) As a broader fallback, inspect nearby ancestor children, but do not
+    # cross another image. This helps when the caption is nested deeper.
+    node = img
+    for depth in range(1, 6):
+        node = getattr(node, 'parent', None)
+        if not node:
+            break
+        seen_image = False
+        for el in node.find_all(recursive=False):
+            if el.find('img') is not None:
+                if el is img or el.find(img) is not None:
+                    continue
+                seen_image = True
+            if seen_image:
+                break
+            t = candidate_text(el)
+            if 20 <= len(t) <= 1200 and not is_credit_text(t):
+                # Only a fallback; explicit caption candidates remain stronger.
+                score = 2500 - depth * 100 + min(len(t), 1000)
+                candidates.append((score, t))
+
+    if candidates:
+        # Deduplicate and choose highest-scoring candidate. If scores are close,
+        # the longer text wins, which is exactly what we want for the screenshot.
+        best = max(candidates, key=lambda x: (x[0], len(x[1])))
+        return best[1]
+
+    # 5) Last fallback: alt text.
+    return clean_text(img.get('alt', ''))
 
 def extract_page(url):
     soup = BeautifulSoup(get_html(url), "html.parser")
