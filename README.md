@@ -45,3 +45,24 @@ Jangan commit API key ke GitHub.
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+
+## V7 — Struktur gallery KapanLagi diperketat
+
+Untuk halaman photo gallery KapanLagi, extractor sekarang hanya mengambil:
+
+```html
+.pages-item[data-type="content-pages"]
+  └── figure.pages-img
+       └── img
+  └── .pages-paragraph
+```
+
+Artinya:
+- gambar di luar `content-pages` tidak diambil;
+- gambar kecil/UI/thumbnail tidak diambil;
+- credit seperti `instagram.com/yoona__lim` tidak dianggap caption;
+- caption foto diambil dari `.pages-paragraph`, yaitu teks panjang yang berada setelah foto;
+- `alt` hanya fallback terakhir.
+
+Untuk template sosial media, gunakan PNG transparan agar template menjadi layer di atas foto.

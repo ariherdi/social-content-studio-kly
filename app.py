@@ -234,96 +234,103 @@ def extract_page(url):
     if desc:
         intro = clean_text(desc.get("content", ""))
 
-    # Only images found in likely BODY containers.
-    containers = find_body_containers(soup)
-
-    # Score containers by editorial signals and image count.
-    scored = []
-    for c in containers:
-        imgs = [x for x in c.find_all("img") if is_article_image(
-            x.get("src") or x.get("data-src") or x.get("data-original") or ""
-        )]
-        if not imgs:
-            continue
-        text_len = len(clean_text(c.get_text(" ", strip=True)))
-        token = " ".join(c.get("class", [])) + " " + c.get("id", "")
-        strong = 1 if BODY_HINT_RE.search(token) else 0
-        # More article text + more gallery images + strong class = better.
-        score = strong * 100000 + min(text_len, 50000) + len(imgs) * 3000
-        scored.append((score, c, imgs))
-
-    if scored:
-        scored.sort(key=lambda x: x[0], reverse=True)
-        # Use the best few containers only, but do not include generic page chrome.
-        chosen = [x[1] for x in scored[:3]]
-    else:
-        chosen = []
-
-    raw_imgs = []
+    photos = []
     seen = set()
 
-    for container in chosen:
-        for img in container.find_all("img"):
-            src = img.get("src") or img.get("data-src") or img.get("data-original") or ""
-            if not is_article_image(src):
-                continue
-            src = src.split("?")[0]
-            fn = filename_from_url(src).lower()
+    # KapanLagi photo-gallery structure:
+    # <div class="pages-item" data-type="content-pages">
+    #   <figure class="pages-img">
+    #      <img ...>
+    #      <figcaption class="pages-img-desc">
+    #         <p class="pages-img-desc-copyright">instagram.com/...</p>
+    #      </figcaption>
+    #   </figure>
+    #   <div class="pages-paragraph ..."><p>LONG EDITORIAL CAPTION...</p></div>
+    # </div>
+    #
+    # IMPORTANT:
+    # - Only images inside content-pages are accepted.
+    # - Only sufficiently large source images are accepted.
+    # - The long text in .pages-paragraph is the photo caption.
+    # - The copyright/Instagram text inside figcaption is NOT the caption.
 
-            # Explicitly reject UI/branding assets.
-            if any(x in fn for x in [
-                "logo", "icon", "avatar", "placeholder", "sprite",
-                "banner", "ads", "advert", "thumbnail", "thumb"
-            ]):
-                continue
+    gallery_pages = soup.select(".pages-item[data-type='content-pages']")
 
-            if src in seen:
-                continue
-            seen.add(src)
-
-            ow, oh = image_size_hint(img)
-            raw_imgs.append({
-                "resized": src,
-                "original": original_url(src) or src,
-                "caption": visible_caption_for_img(img),
-                "html_width": ow,
-                "html_height": oh,
-            })
-
-    # Remove small images. "Large" means at least 600px wide OR 400px high,
-    # and when the actual original can be inspected we require a meaningful area.
-    photos = []
-    for p in raw_imgs:
-        w, h = p["html_width"], p["html_height"]
-
-        if not w and not h:
-            w, h = download_dimensions(p["resized"])
-
-        if w and h:
-            if w < 600 or h < 400:
-                continue
-            p["width"], p["height"] = w, h
-        elif w:
-            if w < 600:
-                continue
-            p["width"], p["height"] = w, None
-        else:
-            # If dimensions cannot be read, keep only CDN article images.
-            p["width"], p["height"] = None, None
-
-        photos.append(p)
-
-    # Dedupe by filename and prefer images with an actual caption.
-    final = []
-    seen_fn = set()
-    for p in photos:
-        fn = filename_from_url(p["resized"])
-        if fn in seen_fn:
+    for page in gallery_pages:
+        figure = page.select_one("figure.pages-img")
+        if not figure:
             continue
-        seen_fn.add(fn)
-        final.append(p)
 
-    return title, intro, final
+        img = figure.find("img")
+        if not img:
+            continue
+
+        src = (
+            img.get("data-src")
+            or img.get("src")
+            or img.get("data-original")
+            or img.get("data-lazy-src")
+            or ""
+        )
+        src = src.split("?")[0]
+
+        if not is_article_image(src):
+            continue
+
+        # Use the actual source dimensions declared by the page.
+        # KapanLagi currently exposes width/height on these gallery images.
+        try:
+            iw = int(img.get("width", 0) or 0)
+            ih = int(img.get("height", 0) or 0)
+        except Exception:
+            iw, ih = 0, 0
+
+        # Reject small/non-editorial images.
+        # The gallery itself uses 670x resized images, while UI/thumbnail
+        # images are typically much smaller.
+        if iw and ih and (iw < 600 or ih < 400):
+            continue
+
+        f = filename_from_url(src).lower()
+        if any(x in f for x in [
+            "logo", "icon", "avatar", "placeholder", "sprite",
+            "banner", "ads", "advert", "close"
+        ]):
+            continue
+
+        if src in seen:
+            continue
+        seen.add(src)
+
+        # EXACT photo description: the .pages-paragraph after the figure.
+        caption = ""
+        paragraph = figure.find_next_sibling(
+            lambda tag: getattr(tag, "name", None) == "div"
+            and "pages-paragraph" in (tag.get("class") or [])
+        )
+        if paragraph:
+            caption = clean_text(paragraph.get_text(" ", strip=True))
+
+        # If HTML nesting changes slightly, search within the same page,
+        # but still ONLY for .pages-paragraph — never use copyright text.
+        if not caption:
+            paragraphs = page.select(".pages-paragraph")
+            if paragraphs:
+                caption = clean_text(paragraphs[0].get_text(" ", strip=True))
+
+        # Alt is only a last-resort fallback.
+        if not caption:
+            caption = clean_text(img.get("alt", ""))
+
+        photos.append({
+            "resized": src,
+            "original": original_url(src) or src,
+            "caption": caption,
+            "width": iw,
+            "height": ih,
+        })
+
+    return title, intro, photos
 
 def get_openai_client():
     if OpenAI is None:
