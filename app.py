@@ -189,82 +189,91 @@ def extract_main_intro(soup):
     return ""
 
 
+def _is_credit_text(text):
+    """Return True for short photo-credit/source lines."""
+    text = clean_text(text)
+    if not text:
+        return True
+    if CREDIT_RE.search(text):
+        return True
+    low = text.lower()
+    credit_words = (
+        "hak cipta", "copyright", "instagram.com", "twitter.com",
+        "facebook.com", "tiktok.com", "sumber:", "source:", "credit:"
+    )
+    return any(w in low for w in credit_words)
+
+
 def extract_photo_editorial_text(figure):
-    """Extract editorial text immediately following one gallery photo.
+    """Extract the editorial paragraph belonging to this photo.
 
-    Important: KapanLagi can return different DOM variants to different clients.
-    In some responses the editorial paragraph is NOT inside the same box-body as
-    the figure. Therefore this parser deliberately does NOT require a shared
-    parent. It walks forward in document order, stops at the next gallery image,
-    and chooses the strongest paragraph-like text candidate.
+    IMPORTANT:
+    Do not require a specific wrapper such as `box-body`.
+    On some KapanLagi responses the paragraph is a sibling of the
+    gallery item rather than a descendant of the same wrapper.
 
-    Never use img alt or photo credit as caption.
+    We walk forward from the figure and stop at the next photo.
+    We prefer `.pages-paragraph`, but also accept normal paragraph-like
+    elements because the live HTML can differ from the supplied DOM.
+    `img[alt]` and `figcaption` are NEVER used as editorial captions.
     """
     if not figure:
         return ""
 
     candidates = []
-    seen_nodes = set()
 
-    for node in figure.find_all_next():
+    for node in figure.next_elements:
         name = getattr(node, "name", None)
 
-        # Stop when the next gallery photo starts.
-        if name == "figure" and "pages-img" in (node.get("class") or []):
-            break
-
-        # Also stop at the next KapanLagi article image if the wrapper is absent.
-        if name == "img" and node is not figure.find("img"):
-            nxt = extract_img_url(node)
-            if is_article_image(nxt):
+        # Never let one photo steal the next photo's description.
+        if name == "figure" and node is not figure:
+            classes = node.get("class") or []
+            if "pages-img" in classes or node.select_one("img"):
                 break
-            continue
 
-        if name not in ("p", "div", "section", "article"):
+        if name not in ("div", "p", "section", "article"):
             continue
-        if node in seen_nodes:
-            continue
-        seen_nodes.add(node)
 
         text = clean_text(node.get_text(" ", strip=True))
-        if not text or len(text) < 40:
-            continue
-        if CREDIT_RE.match(text):
-            continue
-        low = text.lower()
-        if any(x in low for x in [
-            "advertisement - scroll untuk melanjutkan",
-            "hak cipta:",
-            "prev",
-            "next",
-        ]):
+        if len(text) < 40 or _is_credit_text(text):
             continue
 
-        classes = set(node.get("class") or [])
-        score = min(len(text), 800)
+        classes = node.get("class") or []
+        score = 0
+
+        # Exact KapanLagi editorial wrapper gets the highest priority.
         if "pages-paragraph" in classes:
             score += 100000
+
+        # A plain <p> immediately following the figure is also very likely
+        # to be the editorial description.
         if name == "p":
-            score += 5000
-        # Prefer reasonably sized editorial paragraphs over giant wrappers.
-        if len(text) <= 700:
-            score += 1000
-        candidates.append((score, text, name, " ".join(sorted(classes))))
+            score += 10000
+
+        # Prefer shorter, focused editorial paragraphs over giant containers.
+        # Length is only a tie-breaker, not the primary signal.
+        score -= max(0, len(text) - 1200)
+
+        candidates.append((score, len(text), text))
+
+        # We normally only need the first few meaningful candidates before
+        # the next photo. Avoid accidentally selecting a page-wide container.
+        if len(candidates) >= 12:
+            break
 
     if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return candidates[0][2]
 
     return ""
 
 
 def extract_photo_editorial_text_from_page_html(page_html):
-    """Fallback parser for a single KapanLagi photo page.
+    """Fallback parser for a single KapanLagi gallery document.
 
-    The live text representation confirms that the editorial sentence can sit
-    directly after the image and outside the image's box-body. This fallback
-    therefore searches globally after the first gallery figure and before the
-    next gallery image, without relying on a particular wrapper class.
+    This fallback intentionally parses the whole supplied HTML fragment,
+    not only the `.pages-item` wrapper, because the description may be a
+    sibling outside that wrapper.
     """
     if not page_html:
         return ""
@@ -273,6 +282,7 @@ def extract_photo_editorial_text_from_page_html(page_html):
     figure = soup.select_one("figure.pages-img")
     if not figure:
         return ""
+
     return extract_photo_editorial_text(figure)
 
 
@@ -317,9 +327,15 @@ def parse_gallery_html(html, source_url, photos, seen):
         # Caption asli MUST be the long editorial paragraph below the photo.
         # Never use img[alt] or figcaption as a fallback.
         caption = extract_photo_editorial_text(figure)
+        caption_source = "pages-paragraph / document flow" if caption else ""
+
         if not caption:
-            # Use the exact raw HTML of this gallery item as a second parser.
-            caption = extract_photo_editorial_text_from_page_html(str(page))
+            # The description may sit outside the `.pages-item` wrapper,
+            # so parse the whole document rather than `str(page)`.
+            caption = extract_photo_editorial_text_from_page_html(html)
+            if caption:
+                caption_source = "document flow fallback"
+
         if caption:
             diag["editorial_captions"] += 1
 
@@ -327,9 +343,9 @@ def parse_gallery_html(html, source_url, photos, seen):
             "resized": resized,
             "original": original,
             "caption": caption,
-            "caption_source": "editorial-after-photo" if caption else "not-found",
             "filename": filename,
             "source_page": source_url,
+            "caption_source": caption_source,
         })
 
     # Diagnostic fallback for unusual responses without content-pages wrappers.
@@ -349,6 +365,7 @@ def parse_gallery_html(html, source_url, photos, seen):
                 "caption": "",
                 "filename": filename,
                 "source_page": source_url,
+                "caption_source": "",
             })
 
     return diag, soup
@@ -675,7 +692,8 @@ if st.session_state.photos:
                     st.session_state.rewrites[i] = ai_rewrite(p.get("caption", ""))
                     st.rerun()
 
-                st.caption(f"Sumber caption: {p.get('caption_source', 'editorial DOM')}" if p.get('caption') else "Sumber caption: TIDAK DITEMUKAN")
+                if p.get("width") and p.get("height"):
+                    st.caption(f"Ukuran sumber terdeteksi: {p['width']} × {p['height']} px")
 
             with right:
                 try:
