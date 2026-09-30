@@ -63,15 +63,17 @@ def is_article_image(u):
     )
 
 def original_url(resized_url):
+    """Build KapanLagi full-resolution download URL from filename date."""
     f = filename_from_url(resized_url)
-    m = re.search(r"(?<!\d)((?:19|20)\d{6})(?!\d)", f)
+    m = re.search(r"(?<!\\d)((?:19|20)\\d{6})(?!\\d)", f)
     if not m:
         return None
     d = m.group(1)
     return (
-        f"https://cdns.klimg.com/kapanlagi.com/download/g/"
-        f"{d[:4]}/{d[4:6]}/{d[6:8]}/r/{f}"
+        f"https://cdns.klimg.com/kapanlagi.com/"
+        f"download/g/{d[:4]}/{d[4:6]}/{d[6:8]}/r/{f}"
     )
+
 
 def visible_caption_for_img(img):
     """
@@ -237,23 +239,10 @@ def extract_page(url):
     photos = []
     seen = set()
 
-    # KapanLagi photo-gallery structure:
-    # <div class="pages-item" data-type="content-pages">
-    #   <figure class="pages-img">
-    #      <img ...>
-    #      <figcaption class="pages-img-desc">
-    #         <p class="pages-img-desc-copyright">instagram.com/...</p>
-    #      </figcaption>
-    #   </figure>
-    #   <div class="pages-paragraph ..."><p>LONG EDITORIAL CAPTION...</p></div>
-    # </div>
-    #
-    # IMPORTANT:
-    # - Only images inside content-pages are accepted.
-    # - Only sufficiently large source images are accepted.
-    # - The long text in .pages-paragraph is the photo caption.
-    # - The copyright/Instagram text inside figcaption is NOT the caption.
-
+    # Only the KapanLagi photo gallery body:
+    # .pages-item[data-type="content-pages"]
+    #   -> figure.pages-img -> img
+    #   -> .pages-paragraph (long editorial caption)
     gallery_pages = soup.select(".pages-item[data-type='content-pages']")
 
     for page in gallery_pages:
@@ -265,61 +254,36 @@ def extract_page(url):
         if not img:
             continue
 
-        src = (
+        resized = (
             img.get("data-src")
             or img.get("src")
             or img.get("data-original")
             or img.get("data-lazy-src")
             or ""
-        )
-        src = src.split("?")[0]
+        ).split("?")[0]
 
-        if not is_article_image(src):
+        if not is_article_image(resized):
             continue
 
-        # IMPORTANT:
-        # KapanLagi's HTML may display the gallery image with width/height
-        # attributes such as 375x514 even though the CDN source is a large
-        # 670x image. Therefore the "large image" test MUST use the CDN
-        # resize segment (e.g. /resized/670x/), not the HTML display size.
-        resize_match = re.search(r"/resized/(\d+)x(?:/|$)", src, re.I)
-        resize_width = int(resize_match.group(1)) if resize_match else 0
+        filename = filename_from_url(resized)
+        original = original_url(resized)
 
-        try:
-            iw = int(img.get("width", 0) or 0)
-            ih = int(img.get("height", 0) or 0)
-        except Exception:
-            iw, ih = 0, 0
-
-        # Gallery editorial source in this KapanLagi format is 670x.
-        # Reject genuinely small CDN variants such as 50x, 100x, 300x, etc.
-        if resize_width and resize_width < 600:
+        # The final image used by the app is ALWAYS the full-res/download URL.
+        if not filename or not original or original in seen:
             continue
-        if not resize_width and iw and iw < 600:
-            continue
+        seen.add(original)
 
-        f = filename_from_url(src).lower()
-        if any(x in f for x in [
-            "logo", "icon", "avatar", "placeholder", "sprite",
-            "banner", "ads", "advert", "close"
-        ]):
-            continue
-
-        if src in seen:
-            continue
-        seen.add(src)
-
-        # EXACT photo description: the .pages-paragraph after the figure.
+        # Exact long caption below the photo.
         caption = ""
         paragraph = figure.find_next_sibling(
-            lambda tag: getattr(tag, "name", None) == "div"
-            and "pages-paragraph" in (tag.get("class") or [])
+            lambda tag: (
+                getattr(tag, "name", None) == "div"
+                and "pages-paragraph" in (tag.get("class") or [])
+            )
         )
         if paragraph:
             caption = clean_text(paragraph.get_text(" ", strip=True))
 
-        # If HTML nesting changes slightly, search within the same page,
-        # but still ONLY for .pages-paragraph — never use copyright text.
         if not caption:
             paragraphs = page.select(".pages-paragraph")
             if paragraphs:
@@ -330,15 +294,14 @@ def extract_page(url):
             caption = clean_text(img.get("alt", ""))
 
         photos.append({
-            "resized": src,
-            "original": original_url(src) or src,
+            "resized": resized,
+            "original": original,
             "caption": caption,
-            "width": iw,
-            "height": ih,
-            "cdn_width": resize_width,
+            "filename": filename,
         })
 
     return title, intro, photos
+
 
 def get_openai_client():
     if OpenAI is None:

@@ -88,3 +88,16 @@ V8 memiliki bug escaping pada regex pembaca ukuran CDN. Pola:
 sekarang dibaca dengan regex yang benar sehingga `670` terdeteksi sebagai ukuran CDN.
 
 Atribut `width="375"` pada HTML tetap tidak digunakan untuk menolak foto karena itu adalah ukuran display, bukan ukuran sumber CDN.
+
+
+## V10 — Full-res download URL
+
+Foto yang digunakan sekarang selalu dibentuk dari pola KapanLagi:
+
+`https://cdns.klimg.com/kapanlagi.com/download/g/YYYY/MM/DD/r/{filename}`
+
+Tanggal `YYYYMMDD` diambil dari filename foto pada URL resized.
+
+Tidak ada lagi filter ukuran HTML atau filter `670x`. Foto ditentukan hanya dari struktur gallery `content-pages`, kemudian URL final diganti ke URL `download` full-res.
+
+Caption tetap diambil dari `.pages-paragraph`.
