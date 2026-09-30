@@ -46,9 +46,41 @@ def clean_text(s):
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 def get_html(url):
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
+    r = requests.get(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        timeout=30,
+    )
     r.raise_for_status()
     return r.text
+
+def fetch_html(url):
+    """Fetch and return diagnostics as well as HTML."""
+    r = requests.get(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        timeout=30,
+        allow_redirects=True,
+    )
+    return r.text, {
+        "requested_url": url,
+        "final_url": r.url,
+        "status": r.status_code,
+        "content_type": r.headers.get("content-type", ""),
+        "bytes": len(r.content),
+    }
 
 def filename_from_url(u):
     return os.path.basename(urlparse(u).path)
@@ -56,7 +88,7 @@ def filename_from_url(u):
 def is_article_image(u):
     if not u:
         return False
-    u = u.split("?")[0]
+    u = u.split("?")[0].strip()
     return (
         "cdns.klimg.com/resized/" in u
         and bool(re.search(r"\.(jpg|jpeg|png|webp)$", u, re.I))
@@ -74,155 +106,151 @@ def original_url(resized_url):
         f"download/g/{d[:4]}/{d[4:6]}/{d[6:8]}/r/{f}"
     )
 
+def extract_img_url(img):
+    """Get the KapanLagi resized image URL from common lazy-loading attributes."""
+    attrs = ["data-src", "data-original", "data-lazy-src", "src"]
+    for key in attrs:
+        v = img.get(key)
+        if is_article_image(v):
+            return v.split("?")[0]
 
-def visible_caption_for_img(img):
-    """
-    Caption priority:
-    1. figcaption
-    2. caption-like element in same photo wrapper
-    3. visible editorial paragraph near the image
-    4. alt only as last fallback
-    Credit lines are explicitly ignored.
-    """
-    def usable(t):
-        t = clean_text(t)
-        if not t or CREDIT_RE.search(t):
-            return ""
-        # Ignore navigation/UI fragments.
-        if t.lower() in {"prev", "next", "share", "lihat selengkapnya"}:
-            return ""
-        return t
+    for key in ("data-srcset", "srcset"):
+        raw = img.get(key, "")
+        if raw:
+            # Prefer the largest candidate in srcset.
+            candidates = []
+            for part in raw.split(","):
+                bits = part.strip().split()
+                if not bits:
+                    continue
+                u = bits[0]
+                if is_article_image(u):
+                    score = 0
+                    if len(bits) > 1:
+                        m = re.match(r"(\d+)w", bits[1])
+                        if m:
+                            score = int(m.group(1))
+                    candidates.append((score, u.split("?")[0]))
+            if candidates:
+                candidates.sort(reverse=True)
+                return candidates[0][1]
+    return ""
 
-    # 1) figcaption
-    node = img
-    for _ in range(7):
-        node = getattr(node, "parent", None)
-        if not node:
-            break
-        for fc in node.find_all("figcaption"):
-            t = usable(fc.get_text(" ", strip=True))
-            if t:
-                return t
-
-    # 2) Caption-like elements
-    node = img
-    for _ in range(7):
-        node = getattr(node, "parent", None)
-        if not node:
-            break
-        for el in node.find_all(True):
-            cls = " ".join(el.get("class", []))
-            ident = el.get("id", "")
-            if re.search(r"(caption|keterangan|ket-foto|photo-desc|image-desc|photo-caption|description)", cls + " " + ident, re.I):
-                t = usable(el.get_text(" ", strip=True))
-                if t and len(t) >= 20:
-                    return t
-
-    # 3) Look at nearby siblings. Prefer long editorial text, not credits.
-    candidates = []
-    parent = img.parent
-    if parent:
-        for sib in list(parent.children):
-            if sib is img:
-                continue
-            if isinstance(sib, NavigableString):
-                t = usable(str(sib))
-            else:
-                t = usable(sib.get_text(" ", strip=True))
-            if t and 20 <= len(t) <= 1200:
-                candidates.append(t)
-
-        # A common KapanLagi pattern is image -> paragraph -> credit.
-        sib = parent.find_next_sibling()
-        hops = 0
-        while sib is not None and hops < 4:
-            t = usable(sib.get_text(" ", strip=True)) if hasattr(sib, "get_text") else ""
-            if t and 20 <= len(t) <= 1200:
-                candidates.append(t)
-            sib = sib.find_next_sibling()
-            hops += 1
-
-    if candidates:
-        # Editorial paragraph is usually the longest useful text near the photo.
-        candidates.sort(key=lambda x: (len(x), x.count(".")), reverse=True)
-        return candidates[0]
-
-    # 4) Last fallback: alt.
-    return usable(img.get("alt", ""))
-
-def find_body_containers(soup):
-    """
-    Build a small set of likely article/gallery containers.
-    We intentionally do NOT scan the whole page first because that
-    pulls logos, recommendation cards, ads and UI images.
-    """
-    found = []
+def page_urls_from_soup(soup, base_url):
+    urls = []
     seen = set()
 
-    # Strong selectors first.
-    selectors = [
-        "article",
-        "main article",
-        "main",
-        "[class*='article-body']",
-        "[class*='article-content']",
-        "[class*='article-detail']",
-        "[class*='detail-content']",
-        "[class*='photo-detail']",
-        "[class*='photo-content']",
-        "[class*='gallery-content']",
-        "[class*='gallery-detail']",
-        "[id*='article']",
-        "[id*='content']",
-    ]
+    # The supplied KapanLagi DOM exposes exact gallery page URLs in data-pageurl.
+    for el in soup.select(".pages-item[data-pageurl], [data-pageurl]"):
+        u = (el.get("data-pageurl") or "").strip()
+        if u and "kapanlagi.com" in u and u not in seen:
+            seen.add(u)
+            urls.append(u)
 
-    for sel in selectors:
+    # If the live response does not expose those nodes, generate page URLs.
+    # KapanLagi photo galleries use ?page=1, ?page=2, ... for the gallery photos.
+    max_page = 10
+    for el in soup.select("[data-pagemax]"):
         try:
-            for el in soup.select(sel):
-                key = id(el)
-                if key not in seen:
-                    seen.add(key)
-                    found.append(el)
+            max_page = max(max_page, min(30, int(el.get("data-pagemax"))))
         except Exception:
             pass
 
-    # Add containers whose class/id strongly resembles body content.
-    for el in soup.find_all(True):
-        token = " ".join(el.get("class", [])) + " " + el.get("id", "")
-        if BODY_HINT_RE.search(token):
-            key = id(el)
-            if key not in seen:
-                seen.add(key)
-                found.append(el)
+    parsed = urlparse(base_url)
+    base_clean = parsed._replace(query="", fragment="").geturl()
+    for n in range(1, max_page + 1):
+        u = f"{base_clean}?page={n}"
+        if u not in seen:
+            urls.append(u)
+            seen.add(u)
 
-    return found
+    return urls
 
-def image_size_hint(img):
-    for key in ("width", "data-width", "data-original-width"):
-        v = img.get(key)
-        if v and str(v).isdigit():
-            return int(v), None
-    for key in ("height", "data-height", "data-original-height"):
-        v = img.get(key)
-        if v and str(v).isdigit():
-            return None, int(v)
-    return None, None
+def parse_gallery_html(html, source_url, photos, seen):
+    soup = BeautifulSoup(html, "html.parser")
+    diag = {
+        "url": source_url,
+        "content_pages": len(soup.select(".pages-item[data-type='content-pages']")),
+        "pages_img": len(soup.select("figure.pages-img")),
+        "imgs": len(soup.find_all("img")),
+        "article_images": 0,
+    }
 
-def download_dimensions(url):
-    try:
-        r = requests.get(
-            url,
-            headers={"User-Agent": UA, "Range": "bytes=0-65535"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        im = Image.open(io.BytesIO(r.content))
-        return im.width, im.height
-    except Exception:
-        return None, None
+    # First choice: exact gallery structure from the supplied KapanLagi HTML.
+    pages = soup.select(".pages-item[data-type='content-pages']")
+    if not pages:
+        # Some page responses contain the figure directly without the wrapper.
+        pages = soup.select("figure.pages-img")
+
+    for page in pages:
+        if getattr(page, "name", None) == "figure":
+            figure = page
+            img = figure.find("img")
+            caption = ""
+            parent = figure.parent
+            if parent:
+                para = parent.select_one(".pages-paragraph")
+                if para:
+                    caption = clean_text(para.get_text(" ", strip=True))
+        else:
+            figure = page.select_one("figure.pages-img") or page
+            img = figure.find("img") if figure else None
+            caption = ""
+            para = page.select_one(".pages-paragraph")
+            if para:
+                caption = clean_text(para.get_text(" ", strip=True))
+
+        if not img:
+            continue
+
+        resized = extract_img_url(img)
+        if not is_article_image(resized):
+            continue
+        diag["article_images"] += 1
+
+        filename = filename_from_url(resized)
+        original = original_url(resized)
+        if not filename or not original or original in seen:
+            continue
+        seen.add(original)
+
+        if not caption:
+            caption = clean_text(img.get("alt", ""))
+
+        photos.append({
+            "resized": resized,
+            "original": original,
+            "caption": caption,
+            "filename": filename,
+            "source_page": source_url,
+        })
+
+    # Diagnostic fallback: inspect all resized CDN images, but only accept filenames
+    # that contain the KapanLagi YYYYMMDD pattern used by original_url().
+    if not pages:
+        for img in soup.find_all("img"):
+            resized = extract_img_url(img)
+            if not is_article_image(resized):
+                continue
+            filename = filename_from_url(resized)
+            original = original_url(resized)
+            if not filename or not original or original in seen:
+                continue
+            seen.add(original)
+            photos.append({
+                "resized": resized,
+                "original": original,
+                "caption": clean_text(img.get("alt", "")),
+                "filename": filename,
+                "source_page": source_url,
+            })
+
+    return diag, soup
 
 def extract_page(url):
-    soup = BeautifulSoup(get_html(url), "html.parser")
+    # Fetch initial document.
+    html, first_diag = fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
 
     title = ""
     og = soup.find("meta", property="og:title")
@@ -238,70 +266,39 @@ def extract_page(url):
 
     photos = []
     seen = set()
+    diagnostics = []
 
-    # Only the KapanLagi photo gallery body:
-    # .pages-item[data-type="content-pages"]
-    #   -> figure.pages-img -> img
-    #   -> .pages-paragraph (long editorial caption)
-    gallery_pages = soup.select(".pages-item[data-type='content-pages']")
+    # 1. Parse whatever gallery is already present in the initial response.
+    d, _ = parse_gallery_html(html, url, photos, seen)
+    d.update({k: first_diag[k] for k in ("status", "bytes", "content_type", "final_url")})
+    diagnostics.append(d)
 
-    for page in gallery_pages:
-        figure = page.select_one("figure.pages-img")
-        if not figure:
+    # 2. Crucial fallback: crawl the gallery page URLs.
+    page_urls = page_urls_from_soup(soup, url)
+    for page_url in page_urls:
+        if page_url == url:
             continue
+        if len(photos) >= 30:
+            break
+        try:
+            page_html, pd = fetch_html(page_url)
+            pdg, _ = parse_gallery_html(page_html, page_url, photos, seen)
+            pdg.update({k: pd[k] for k in ("status", "bytes", "content_type", "final_url")})
+            diagnostics.append(pdg)
+        except Exception as e:
+            diagnostics.append({"url": page_url, "error": str(e)})
 
-        img = figure.find("img")
-        if not img:
+    # Remove duplicate diagnostics for repeated URLs while preserving order.
+    unique_diag = []
+    seen_diag = set()
+    for d in diagnostics:
+        key = d.get("url")
+        if key in seen_diag:
             continue
+        seen_diag.add(key)
+        unique_diag.append(d)
 
-        resized = (
-            img.get("data-src")
-            or img.get("src")
-            or img.get("data-original")
-            or img.get("data-lazy-src")
-            or ""
-        ).split("?")[0]
-
-        if not is_article_image(resized):
-            continue
-
-        filename = filename_from_url(resized)
-        original = original_url(resized)
-
-        # The final image used by the app is ALWAYS the full-res/download URL.
-        if not filename or not original or original in seen:
-            continue
-        seen.add(original)
-
-        # Exact long caption below the photo.
-        caption = ""
-        paragraph = figure.find_next_sibling(
-            lambda tag: (
-                getattr(tag, "name", None) == "div"
-                and "pages-paragraph" in (tag.get("class") or [])
-            )
-        )
-        if paragraph:
-            caption = clean_text(paragraph.get_text(" ", strip=True))
-
-        if not caption:
-            paragraphs = page.select(".pages-paragraph")
-            if paragraphs:
-                caption = clean_text(paragraphs[0].get_text(" ", strip=True))
-
-        # Alt is only a last-resort fallback.
-        if not caption:
-            caption = clean_text(img.get("alt", ""))
-
-        photos.append({
-            "resized": resized,
-            "original": original,
-            "caption": caption,
-            "filename": filename,
-        })
-
-    return title, intro, photos
-
+    return title, intro, photos, unique_diag
 
 def get_openai_client():
     if OpenAI is None:
@@ -457,6 +454,8 @@ if "title" not in st.session_state:
     st.session_state.title = ""
 if "intro" not in st.session_state:
     st.session_state.intro = ""
+if "diagnostics" not in st.session_state:
+    st.session_state.diagnostics = []
 
 url = st.text_input(
     "URL artikel KapanLagi.com",
@@ -465,12 +464,18 @@ url = st.text_input(
 
 if st.button("🔎 Analisis Artikel", type="primary") and url:
     try:
-        title, intro, photos = extract_page(url)
+        title, intro, photos, diagnostics = extract_page(url)
+        st.session_state.diagnostics = diagnostics
         st.session_state.title = title
         st.session_state.intro = intro
         st.session_state.photos = photos
         st.session_state.rewrites = {}
         st.success(f"Ditemukan {len(photos)} foto besar dari body content.")
+        if not photos:
+            st.warning("Gallery tidak muncul pada HTML awal, jadi app sudah mencoba URL halaman foto ?page=1, ?page=2, dan seterusnya. Lihat Diagnosis Fetch di bawah untuk mengetahui respons server.")
+            with st.expander("🔧 Diagnosis Fetch & Parser", expanded=True):
+                st.dataframe(st.session_state.diagnostics, use_container_width=True)
+                st.caption("content_pages = jumlah .pages-item[data-type='content-pages']; pages_img = jumlah figure.pages-img; article_images = CDN resized yang berhasil dikenali.")
     except Exception as e:
         st.error(f"Gagal membaca artikel: {e}")
 
