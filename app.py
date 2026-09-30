@@ -190,100 +190,156 @@ def extract_main_intro(soup):
 
 
 def _is_credit_text(text):
-    """Return True for short photo-credit/source lines."""
     text = clean_text(text)
     if not text:
         return True
     if CREDIT_RE.search(text):
         return True
     low = text.lower()
-    credit_words = (
+    return any(x in low for x in (
         "hak cipta", "copyright", "instagram.com", "twitter.com",
         "facebook.com", "tiktok.com", "sumber:", "source:", "credit:"
-    )
-    return any(w in low for w in credit_words)
+    ))
+
+
+def _caption_candidate(node):
+    """Return a plausible editorial paragraph from a DOM node."""
+    name = getattr(node, "name", None)
+    if name not in ("p", "div", "section", "article", "span"):
+        return None
+    text = clean_text(node.get_text(" ", strip=True))
+    if len(text) < 40 or _is_credit_text(text):
+        return None
+
+    # Reject page-wide containers. Editorial captions are normally concise.
+    if len(text) > 900:
+        return None
+
+    classes = node.get("class") or []
+    score = 0
+    if "pages-paragraph" in classes:
+        score += 100000
+    if name == "p":
+        score += 50000
+    if any(x in " ".join(classes).lower() for x in ("caption", "description", "paragraph")):
+        score += 10000
+    # Prefer text that looks like normal editorial prose rather than UI.
+    if text.endswith((".", "!", "?")):
+        score += 1000
+    score += min(len(text), 500)
+    return score, text
 
 
 def extract_photo_editorial_text(figure):
-    """Extract the editorial paragraph belonging to this photo.
+    """Extract the editorial text belonging to one KapanLagi gallery photo.
 
-    IMPORTANT:
-    Do not require a specific wrapper such as `box-body`.
-    On some KapanLagi responses the paragraph is a sibling of the
-    gallery item rather than a descendant of the same wrapper.
-
-    We walk forward from the figure and stop at the next photo.
-    We prefer `.pages-paragraph`, but also accept normal paragraph-like
-    elements because the live HTML can differ from the supplied DOM.
-    `img[alt]` and `figcaption` are NEVER used as editorial captions.
+    This intentionally does NOT depend on box-body, pages-item, figcaption,
+    alt text, or any particular wrapper. It follows the actual document flow
+    after the image and stops at the next gallery image.
     """
     if not figure:
         return ""
 
     candidates = []
-
     for node in figure.next_elements:
         name = getattr(node, "name", None)
 
-        # Never let one photo steal the next photo's description.
+        # Stop when the next gallery photo starts.
         if name == "figure" and node is not figure:
             classes = node.get("class") or []
-            if "pages-img" in classes or node.select_one("img"):
+            if "pages-img" in classes or node.find("img") is not None:
                 break
 
-        if name not in ("div", "p", "section", "article"):
-            continue
+        cand = _caption_candidate(node)
+        if cand:
+            candidates.append(cand)
+            # The first exact pages-paragraph is the desired answer.
+            if "pages-paragraph" in (node.get("class") or []):
+                return cand[1]
 
-        text = clean_text(node.get_text(" ", strip=True))
-        if len(text) < 40 or _is_credit_text(text):
-            continue
-
-        classes = node.get("class") or []
-        score = 0
-
-        # Exact KapanLagi editorial wrapper gets the highest priority.
-        if "pages-paragraph" in classes:
-            score += 100000
-
-        # A plain <p> immediately following the figure is also very likely
-        # to be the editorial description.
-        if name == "p":
-            score += 10000
-
-        # Prefer shorter, focused editorial paragraphs over giant containers.
-        # Length is only a tie-breaker, not the primary signal.
-        score -= max(0, len(text) - 1200)
-
-        candidates.append((score, len(text), text))
-
-        # We normally only need the first few meaningful candidates before
-        # the next photo. Avoid accidentally selecting a page-wide container.
-        if len(candidates) >= 12:
+        # Don't wander through an entire page if a huge wrapper is encountered.
+        if len(candidates) >= 20:
             break
 
     if candidates:
-        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        return candidates[0][2]
-
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
     return ""
 
 
-def extract_photo_editorial_text_from_page_html(page_html):
-    """Fallback parser for a single KapanLagi gallery document.
+def extract_caption_from_raw_html(html, filename):
+    """Raw HTML fallback keyed to the actual photo filename.
 
-    This fallback intentionally parses the whole supplied HTML fragment,
-    not only the `.pages-item` wrapper, because the description may be a
-    sibling outside that wrapper.
+    Useful when the DOM wrapper differs between KapanLagi responses.
     """
+    if not html or not filename:
+        return ""
+
+    # Find the actual image filename, then inspect only the document flow
+    # until the next gallery image filename.
+    pos = html.find(filename)
+    if pos < 0:
+        return ""
+
+    tail = html[pos:]
+    # A gallery image normally has another *_YYYYMMDD_* filename later.
+    nxt = re.search(r'[A-Za-z0-9._-]+-(?:19|20)\d{6}-[A-Za-z0-9._-]+\.(?:jpg|jpeg|png|webp)', tail[len(filename):], re.I)
+    if nxt:
+        tail = tail[:len(filename) + nxt.start()]
+    tail = tail[:20000]
+
+    frag = BeautifulSoup(tail, "html.parser")
+    candidates = []
+    for node in frag.find_all(["p", "div", "section", "article", "span"]):
+        cand = _caption_candidate(node)
+        if cand:
+            candidates.append(cand)
+            if "pages-paragraph" in (node.get("class") or []):
+                return cand[1]
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    return ""
+
+
+def extract_photo_editorial_text_from_page_html(page_html, filename=""):
+    """Fallback using the complete document, never only the gallery wrapper."""
     if not page_html:
         return ""
-
     soup = BeautifulSoup(page_html, "html.parser")
+    if filename:
+        raw = extract_caption_from_raw_html(page_html, filename)
+        if raw:
+            return raw
     figure = soup.select_one("figure.pages-img")
-    if not figure:
-        return ""
+    if figure:
+        return extract_photo_editorial_text(figure)
+    return ""
 
-    return extract_photo_editorial_text(figure)
+def caption_debug_info(html, figure, filename):
+    """Return small diagnostics showing what the app actually received."""
+    info = {"filename_found": False, "after_filename_text": "", "nearby_text_nodes": []}
+    if not html or not filename:
+        return info
+    pos = html.find(filename)
+    info["filename_found"] = pos >= 0
+    if pos >= 0:
+        snippet = html[pos + len(filename): pos + len(filename) + 5000]
+        # Show text only, so the UI is readable.
+        frag = BeautifulSoup(snippet, "html.parser")
+        info["after_filename_text"] = clean_text(frag.get_text(" ", strip=True))[:2000]
+    if figure:
+        count = 0
+        for node in figure.next_elements:
+            if getattr(node, "name", None) == "figure" and node is not figure:
+                break
+            cand = _caption_candidate(node)
+            if cand:
+                info["nearby_text_nodes"].append(cand[1][:500])
+                count += 1
+                if count >= 8:
+                    break
+    return info
 
 
 def parse_gallery_html(html, source_url, photos, seen):
@@ -332,12 +388,14 @@ def parse_gallery_html(html, source_url, photos, seen):
         if not caption:
             # The description may sit outside the `.pages-item` wrapper,
             # so parse the whole document rather than `str(page)`.
-            caption = extract_photo_editorial_text_from_page_html(html)
+            caption = extract_photo_editorial_text_from_page_html(html, filename)
             if caption:
                 caption_source = "document flow fallback"
 
         if caption:
             diag["editorial_captions"] += 1
+
+        debug = caption_debug_info(html, figure, filename) if not caption else {}
 
         photos.append({
             "resized": resized,
@@ -346,6 +404,7 @@ def parse_gallery_html(html, source_url, photos, seen):
             "filename": filename,
             "source_page": source_url,
             "caption_source": caption_source,
+            "caption_debug": debug,
         })
 
     # Diagnostic fallback for unusual responses without content-pages wrappers.
@@ -674,6 +733,15 @@ if st.session_state.photos:
                     key=f"orig_{i}",
                     label_visibility="collapsed",
                 )
+
+                if not p.get("caption"):
+                    st.warning("Caption editorial belum ditemukan dari HTML yang diterima aplikasi.")
+                    dbg = p.get("caption_debug", {})
+                    with st.expander("🔧 Debug HTML caption", expanded=False):
+                        st.write("Filename ditemukan:", dbg.get("filename_found", False))
+                        st.text_area("Teks setelah filename", dbg.get("after_filename_text", ""), height=180, disabled=True, key=f"dbg_after_{i}")
+                        st.write("Kandidat teks setelah foto:")
+                        st.json(dbg.get("nearby_text_nodes", []))
 
                 if i not in st.session_state.rewrites:
                     st.session_state.rewrites[i] = ai_rewrite(p.get("caption", ""))

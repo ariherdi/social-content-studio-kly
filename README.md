@@ -1,3 +1,3 @@
-# Social Content Studio — KapanLagi V17
+# Social Content Studio — KapanLagi V21
 
-V17 memperbaiki ekstraksi caption foto KapanLagi. Caption asli hanya diambil dari teks editorial `.pages-paragraph` setelah `figure.pages-img` dalam blok foto yang sama. `img alt` dan credit/figcaption tidak pernah dipakai sebagai caption.
+Perbaikan parser caption: tidak bergantung pada `box-body`, mengikuti document flow setelah figure, dan fallback raw HTML berdasarkan filename foto. Tidak menggunakan alt/figcaption sebagai caption editorial.
