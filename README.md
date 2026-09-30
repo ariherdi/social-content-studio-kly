@@ -66,3 +66,14 @@ Artinya:
 - `alt` hanya fallback terakhir.
 
 Untuk template sosial media, gunakan PNG transparan agar template menjadi layer di atas foto.
+
+
+## V8 — Perbaikan filter ukuran foto
+
+KapanLagi dapat memiliki URL CDN seperti:
+
+`/resized/670x/...`
+
+tetapi atribut HTML-nya dapat berupa `width="375" height="514"` karena ukuran tersebut adalah ukuran display halaman, bukan ukuran sumber CDN.
+
+V8 menggunakan ukuran pada URL CDN (`670x`) untuk menentukan apakah foto termasuk foto besar. Jadi foto gallery 670x tetap diambil meskipun display HTML-nya 375px.

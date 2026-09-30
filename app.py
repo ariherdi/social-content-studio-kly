@@ -277,18 +277,25 @@ def extract_page(url):
         if not is_article_image(src):
             continue
 
-        # Use the actual source dimensions declared by the page.
-        # KapanLagi currently exposes width/height on these gallery images.
+        # IMPORTANT:
+        # KapanLagi's HTML may display the gallery image with width/height
+        # attributes such as 375x514 even though the CDN source is a large
+        # 670x image. Therefore the "large image" test MUST use the CDN
+        # resize segment (e.g. /resized/670x/), not the HTML display size.
+        resize_match = re.search(r"/resized/(\\d+)x(?:/|$)", src, re.I)
+        resize_width = int(resize_match.group(1)) if resize_match else 0
+
         try:
             iw = int(img.get("width", 0) or 0)
             ih = int(img.get("height", 0) or 0)
         except Exception:
             iw, ih = 0, 0
 
-        # Reject small/non-editorial images.
-        # The gallery itself uses 670x resized images, while UI/thumbnail
-        # images are typically much smaller.
-        if iw and ih and (iw < 600 or ih < 400):
+        # Gallery editorial source in this KapanLagi format is 670x.
+        # Reject genuinely small CDN variants such as 50x, 100x, 300x, etc.
+        if resize_width and resize_width < 600:
+            continue
+        if not resize_width and iw and iw < 600:
             continue
 
         f = filename_from_url(src).lower()
@@ -328,6 +335,7 @@ def extract_page(url):
             "caption": caption,
             "width": iw,
             "height": ih,
+            "cdn_width": resize_width,
         })
 
     return title, intro, photos
