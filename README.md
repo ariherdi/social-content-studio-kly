@@ -1,9 +1,11 @@
-# Social Content Studio — KapanLagi V12
+# Social Content Studio — KapanLagi V14
 
-V12 memperbaiki ekstraksi gallery KapanLagi dengan fallback multi-page:
-- baca `.pages-item[data-type="content-pages"]` bila tersedia;
-- baca `data-pageurl` dari DOM bila tersedia;
-- fallback crawl `?page=1..N`;
-- ekstraksi gambar dari `data-src`, `src`, `data-original`, `data-lazy-src`, dan srcset;
-- original image selalu dibentuk dari filename + tanggal YYYYMMDD ke format `/kapanlagi.com/download/g/YYYY/MM/DD/r/filename`;
-- menampilkan diagnosis fetch/parser jika hasil 0 foto.
+POC Streamlit untuk mengambil artikel foto KapanLagi.com.
+
+## Extraction rules
+- Deskripsi utama: `.pages-item[data-type="page-intro"] .pages-paragraph`
+- Foto: `.pages-item[data-type="content-pages"] figure.pages-img img`
+- Teks editorial foto: `.pages-paragraph` tepat setelah `figure.pages-img`, pada blok `STARTOFPAGEDESCRIPTIONBOTTOM`
+- `figcaption.pages-img-desc` / credit tidak digunakan sebagai caption editorial.
+- `img alt` hanya fallback jika teks editorial panjang benar-benar kosong.
+- URL final foto memakai format `download/g/YYYY/MM/DD/r/{filename}` berdasarkan tanggal 8 digit pada filename.

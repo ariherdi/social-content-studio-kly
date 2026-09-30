@@ -166,6 +166,74 @@ def page_urls_from_soup(soup, base_url):
 
     return urls
 
+def extract_main_intro(soup):
+    """Extract the actual KapanLagi photo-article intro, not meta description."""
+    intro_box = soup.select_one('.pages-item[data-type="page-intro"]')
+    if intro_box:
+        para = intro_box.select_one('.pages-paragraph')
+        if para:
+            # Keep paragraph separation, but normalize whitespace inside paragraphs.
+            parts = [clean_text(p.get_text(" ", strip=True)) for p in para.find_all("p")]
+            parts = [x for x in parts if x]
+            if parts:
+                return "\n\n".join(parts)
+
+    # Fallback for variants where the intro wrapper is not typed as page-intro.
+    for para in soup.select('.pages-paragraph'):
+        parent = para.find_parent(class_='pages-item')
+        if parent and parent.get('data-type') == 'page-intro':
+            parts = [clean_text(p.get_text(" ", strip=True)) for p in para.find_all("p")]
+            parts = [x for x in parts if x]
+            if parts:
+                return "\n\n".join(parts)
+    return ""
+
+
+def extract_photo_editorial_text(figure):
+    """Extract ONLY the long editorial text immediately following a photo figure.
+
+    KapanLagi structure:
+      <figure class="pages-img">...</figure>
+      <!--STARTOFPAGEDESCRIPTIONBOTTOM-->
+      <div class="pages-paragraph ..."><p>EDITORIAL TEXT</p></div>
+      <!--ENDOFPAGEDESCRIPTIONBOTTOM-->
+
+    The figcaption/pages-img-desc is a photo credit and must never be used as
+    the editorial caption. img[alt] is only a last-resort fallback.
+    """
+    if not figure:
+        return ""
+
+    # 1) Most precise: inspect the immediate DOM sequence after the figure.
+    node = figure.next_sibling
+    while node is not None:
+        if isinstance(node, NavigableString):
+            node = node.next_sibling
+            continue
+
+        if getattr(node, "name", None) == "div" and "pages-paragraph" in (node.get("class") or []):
+            return clean_text(node.get_text(" ", strip=True))
+
+        # Stop when another major content block begins. This prevents a caption
+        # from one photo being accidentally assigned to the previous photo.
+        if getattr(node, "name", None) == "div":
+            cls = set(node.get("class") or [])
+            if "box" in cls or "pages-item" in cls:
+                break
+        node = node.next_sibling
+
+    # 2) Robust fallback: within the same .box-body, choose the first
+    # .pages-paragraph whose preceding figure is THIS exact figure.
+    box_body = figure.find_parent(class_="box-body")
+    if box_body:
+        for candidate in box_body.select(".pages-paragraph"):
+            prev = candidate.find_previous("figure", class_="pages-img")
+            if prev is figure:
+                return clean_text(candidate.get_text(" ", strip=True))
+
+    return ""
+
+
 def parse_gallery_html(html, source_url, photos, seen):
     soup = BeautifulSoup(html, "html.parser")
     diag = {
@@ -174,12 +242,12 @@ def parse_gallery_html(html, source_url, photos, seen):
         "pages_img": len(soup.select("figure.pages-img")),
         "imgs": len(soup.find_all("img")),
         "article_images": 0,
+        "editorial_captions": 0,
     }
 
-    # First choice: exact gallery structure from the supplied KapanLagi HTML.
+    # Exact KapanLagi photo-gallery structure.
     pages = soup.select(".pages-item[data-type='content-pages']")
     if not pages:
-        # Some page responses contain the figure directly without the wrapper.
         pages = soup.select("figure.pages-img")
 
     for page in pages:
@@ -189,44 +257,27 @@ def parse_gallery_html(html, source_url, photos, seen):
             figure = page.select_one("figure.pages-img") or page
 
         img = figure.find("img") if figure else None
-        caption = ""
-
-        # IMPORTANT: KapanLagi's real editorial text is NOT the image alt/caption.
-        # It is the .pages-paragraph that appears AFTER the figure, inside the
-        # same .box-body. We deliberately find that paragraph relative to the
-        # figure so ads/other markup inside the figure cannot break extraction.
-        if figure:
-            box_body = figure.find_parent(class_="box-body")
-            if box_body:
-                para = figure.find_next("div", class_="pages-paragraph")
-                if para and para.find_parent(class_="box-body") is box_body:
-                    caption = clean_text(para.get_text(" ", strip=True))
-
-                # Extra fallback: inspect all paragraphs in this exact box and
-                # take the first one that occurs after the figure in the DOM.
-                if not caption:
-                    for candidate in box_body.select(".pages-paragraph"):
-                        if candidate.find_parent(class_="box-body") is box_body:
-                            previous_figures = candidate.find_all_previous("figure", class_="pages-img")
-                            if previous_figures and previous_figures[0] is figure:
-                                caption = clean_text(candidate.get_text(" ", strip=True))
-                                break
-
         if not img:
             continue
 
         resized = extract_img_url(img)
         if not is_article_image(resized):
             continue
-        diag["article_images"] += 1
 
         filename = filename_from_url(resized)
         original = original_url(resized)
         if not filename or not original or original in seen:
             continue
+
+        diag["article_images"] += 1
         seen.add(original)
 
-        if not caption:
+        # Editorial text is the PRIMARY source. Do not use figcaption/credit.
+        caption = extract_photo_editorial_text(figure)
+        if caption:
+            diag["editorial_captions"] += 1
+        else:
+            # Only when the long editorial text is genuinely absent, use alt.
             caption = clean_text(img.get("alt", ""))
 
         photos.append({
@@ -237,8 +288,7 @@ def parse_gallery_html(html, source_url, photos, seen):
             "source_page": source_url,
         })
 
-    # Diagnostic fallback: inspect all resized CDN images, but only accept filenames
-    # that contain the KapanLagi YYYYMMDD pattern used by original_url().
+    # Diagnostic fallback for unusual responses without content-pages wrappers.
     if not pages:
         for img in soup.find_all("img"):
             resized = extract_img_url(img)
@@ -271,10 +321,13 @@ def extract_page(url):
     if not title and soup.title:
         title = clean_text(soup.title.get_text())
 
-    intro = ""
-    desc = soup.find("meta", attrs={"name": "description"})
-    if desc:
-        intro = clean_text(desc.get("content", ""))
+    # KapanLagi photo articles store the real article introduction inside
+    # the page-intro block. Meta description is not the editorial intro.
+    intro = extract_main_intro(soup)
+    if not intro:
+        desc = soup.find("meta", attrs={"name": "description"})
+        if desc:
+            intro = clean_text(desc.get("content", ""))
 
     photos = []
     seen = set()
