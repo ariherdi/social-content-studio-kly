@@ -190,67 +190,105 @@ def extract_main_intro(soup):
 
 
 def extract_photo_editorial_text(figure):
-    """Return the editorial paragraph belonging to this exact gallery photo.
+    """Extract only the editorial text belonging to one KapanLagi photo.
 
-    KapanLagi's photo item is consistently:
-      <figure class="pages-img">...</figure>
-      <!--STARTOFPAGEDESCRIPTIONBOTTOM-->
-      <div class="pages-paragraph ..."><p>...</p></div>
+    Priority:
+    1) .pages-paragraph after the figure in the same box-body.
+    2) Any paragraph-like element after the figure in that same box-body,
+       before the next photo, choosing the longest plausible editorial text.
 
-    IMPORTANT: alt text and figcaption/credit are NEVER caption sources.
+    Never use img alt or photo credit as caption.
     """
     if not figure:
         return ""
 
     box_body = figure.find_parent("div", class_="box-body")
+    if box_body is None:
+        return ""
 
-    # Strategy A: walk the DOM after this figure. Stop at the next photo.
-    # This deliberately does NOT require the paragraph to be a direct sibling.
+    candidates = []
+    seen_nodes = set()
+
+    # Walk everything after the figure, but stop at the next gallery photo.
     for node in figure.find_all_next():
         if getattr(node, "name", None) == "figure" and "pages-img" in (node.get("class") or []):
             break
-        if getattr(node, "name", None) == "div" and "pages-paragraph" in (node.get("class") or []):
-            if box_body is None or node.find_parent("div", class_="box-body") is box_body:
-                text = clean_text(node.get_text(" ", strip=True))
-                if text and not CREDIT_RE.match(text):
-                    return text
+        if getattr(node, "name", None) not in ("div", "p", "section", "article"):
+            continue
+        if node.find_parent("div", class_="box-body") is not box_body:
+            continue
 
-    # Strategy B: inspect every paragraph in the same box and bind it to the
-    # immediately preceding gallery figure. This handles unusual DOM nesting.
-    if box_body is not None:
-        for candidate in box_body.select(".pages-paragraph"):
-            prev = candidate.find_previous("figure", class_="pages-img")
-            if prev is figure:
-                text = clean_text(candidate.get_text(" ", strip=True))
-                if text and not CREDIT_RE.match(text):
-                    return text
+        classes = set(node.get("class") or [])
+        text = clean_text(node.get_text(" ", strip=True))
+        if not text or len(text) < 40:
+            continue
+        if node in seen_nodes:
+            continue
+        seen_nodes.add(node)
+
+        # Credits, labels and UI text are not editorial captions.
+        if CREDIT_RE.match(text):
+            continue
+        low = text.lower()
+        if any(x in low for x in ["advertisement - scroll untuk melanjutkan", "hak cipta:"]):
+            continue
+
+        # Prefer the exact KapanLagi editorial class very strongly.
+        score = len(text)
+        if "pages-paragraph" in classes:
+            score += 100000
+        if node.name == "p":
+            score += 1000
+        candidates.append((score, text))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
 
     return ""
 
-
 def extract_photo_editorial_text_from_page_html(page_html):
-    """Raw HTML parser for KapanLagi's figure -> editorial paragraph."""
+    """Raw HTML fallback: extract editorial text after the first gallery figure.
+
+    This intentionally does not depend on exact class names for the paragraph,
+    because KapanLagi responses can differ between crawler/mobile variants.
+    """
     if not page_html:
         return ""
 
-    # First, split the raw item at the exact KapanLagi marker when present.
-    # We intentionally allow arbitrary whitespace/comments/HTML between the
-    # figure and paragraph because ads/formatting can vary between responses.
-    m = re.search(
-        r'<figure\b[^>]*class=["\'][^"\']*\bpages-img\b[^"\']*["\'][\s\S]*?</figure>'
-        r'[\s\S]*?'
-        r'<div\b[^>]*class=["\'][^"\']*\bpages-paragraph\b[^"\']*["\'][^>]*>'
-        r'([\s\S]*?)</div>',
-        page_html,
-        re.I,
-    )
-    if not m:
+    soup = BeautifulSoup(page_html, "html.parser")
+    figure = soup.select_one("figure.pages-img")
+    if not figure:
         return ""
 
-    frag = BeautifulSoup(m.group(1), "html.parser")
-    text = clean_text(frag.get_text(" ", strip=True))
-    if text and not CREDIT_RE.match(text):
-        return text
+    box_body = figure.find_parent("div", class_="box-body")
+    if box_body is None:
+        return ""
+
+    candidates = []
+    for node in figure.find_all_next():
+        if getattr(node, "name", None) == "figure" and "pages-img" in (node.get("class") or []):
+            break
+        if getattr(node, "name", None) not in ("div", "p", "section", "article"):
+            continue
+        if node.find_parent("div", class_="box-body") is not box_body:
+            continue
+        text = clean_text(node.get_text(" ", strip=True))
+        if len(text) < 40 or CREDIT_RE.match(text):
+            continue
+        low = text.lower()
+        if any(x in low for x in ["advertisement - scroll untuk melanjutkan", "hak cipta:"]):
+            continue
+        score = len(text)
+        if "pages-paragraph" in set(node.get("class") or []):
+            score += 100000
+        if node.name == "p":
+            score += 1000
+        candidates.append((score, text))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
     return ""
 
 def parse_gallery_html(html, source_url, photos, seen):
@@ -304,6 +342,7 @@ def parse_gallery_html(html, source_url, photos, seen):
             "resized": resized,
             "original": original,
             "caption": caption,
+            "caption_source": "pages-paragraph" if caption else "not-found",
             "filename": filename,
             "source_page": source_url,
         })
@@ -651,8 +690,7 @@ if st.session_state.photos:
                     st.session_state.rewrites[i] = ai_rewrite(p.get("caption", ""))
                     st.rerun()
 
-                if p.get("width") and p.get("height"):
-                    st.caption(f"Ukuran sumber terdeteksi: {p['width']} × {p['height']} px")
+                st.caption(f"Sumber caption: {p.get('caption_source', 'editorial DOM')}" if p.get('caption') else "Sumber caption: TIDAK DITEMUKAN")
 
             with right:
                 try:
